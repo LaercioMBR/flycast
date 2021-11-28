@@ -394,49 +394,20 @@ extern AudioVolumeOption AudioVolume;
 class RendererOption : public Option<RenderType> {
 public:
 	RendererOption()
-#ifdef _WIN32
+#ifdef USE_DX9
 		: Option<RenderType>("pvr.rend", RenderType::DirectX9) {}
+#elif defined(TARGET_UWP)
+		: Option<RenderType>("pvr.rend", RenderType::DirectX11) {}
 #else
 		: Option<RenderType>("pvr.rend", RenderType::OpenGL) {}
 #endif
 
-	bool isOpenGL() const {
-		return value == RenderType::OpenGL || value == RenderType::OpenGL_OIT;
-	}
-	bool isVulkan() const {
-		return value == RenderType::Vulkan || value == RenderType::Vulkan_OIT;
-	}
-	bool isDirectX() const {
-		return value == RenderType::DirectX9;
-	}
-
-	void set(RenderType v)
-	{
-		newValue = v;
-	}
 	RenderType& operator=(const RenderType& v) { set(v); return value; }
 
-	void load() override {
-		RenderType current = value;
-		Option<RenderType>::load();
-		newValue = value;
-		value = current;
-	}
-
 	void reset() override {
-		// don't reset the value to avoid vk -> gl -> vk quick switching
+		// don't reset the value to avoid quick switching when starting a game
 		overridden = false;
 	}
-
-	bool pendingChange() {
-		return newValue != value;
-	}
-	void commit() {
-		value = newValue;
-	}
-
-private:
-	RenderType newValue = RenderType();
 };
 extern RendererOption RendererType;
 extern Option<bool> UseMipmaps;
@@ -468,6 +439,7 @@ extern Option<bool> VSync;
 extern Option<u64> PixelBufferSize;
 extern Option<int> AnisotropicFiltering;
 extern Option<bool> ThreadedRendering;
+extern Option<bool> DupeFrames;
 
 // Misc
 
@@ -514,6 +486,10 @@ extern Option<bool> UseRawInput;
 #else
 constexpr bool UseRawInput = false;
 #endif
+
+#ifdef USE_LUA
+extern OptionString LuaFileName;
+#endif 
 
 } // namespace config
 

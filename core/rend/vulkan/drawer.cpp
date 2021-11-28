@@ -183,10 +183,28 @@ void Drawer::DrawPoly(const vk::CommandBuffer& cmdBuffer, u32 listType, bool sor
 	cmdBuffer.drawIndexed(count, 1, first, 0, 0);
 }
 
-void Drawer::DrawSorted(const vk::CommandBuffer& cmdBuffer, const std::vector<SortTrigDrawParam>& polys)
+void Drawer::DrawSorted(const vk::CommandBuffer& cmdBuffer, const std::vector<SortTrigDrawParam>& polys, bool multipass)
 {
 	for (const SortTrigDrawParam& param : polys)
 		DrawPoly(cmdBuffer, ListType_Translucent, true, *param.ppid, pvrrc.idx.used() + param.first, param.count);
+	if (multipass && config::TranslucentPolygonDepthMask)
+	{
+		// Write to the depth buffer now. The next render pass might need it. (Cosmic Smash)
+		for (const SortTrigDrawParam& param : polys)
+		{
+			if (param.ppid->isp.ZWriteDis)
+				continue;
+			vk::Pipeline pipeline = pipelineManager->GetDepthPassPipeline(param.ppid->isp.CullMode);
+			cmdBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+			vk::Rect2D scissorRect;
+			TileClipping tileClip = SetTileClip(param.ppid->tileclip, scissorRect);
+			if (tileClip == TileClipping::Outside)
+				SetScissor(cmdBuffer, scissorRect);
+			else
+				SetScissor(cmdBuffer, baseScissor);
+			cmdBuffer.drawIndexed(param.count, 1, pvrrc.idx.used() + param.first, 0, 0);
+		}
+	}
 }
 
 void Drawer::DrawList(const vk::CommandBuffer& cmdBuffer, u32 listType, bool sortTriangles, const List<PolyParam>& polys, u32 first, u32 last)
@@ -314,6 +332,11 @@ bool Drawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
 	currentScissor = vk::Rect2D();
 
 	vk::CommandBuffer cmdBuffer = BeginRenderPass();
+	if (!pvrrc.isRTT && (FB_R_CTRL.fb_enable == 0 || VO_CONTROL.blank_video == 1))
+	{
+		// Video output disabled
+		return true;
+	}
 
 	SetProvokingVertices();
 
@@ -355,7 +378,7 @@ bool Drawer::Draw(const Texture *fogTexture, const Texture *paletteTexture)
         {
 			if (!config::PerStripSorting)
 			{
-				DrawSorted(cmdBuffer, sortedPolys[render_pass]);
+				DrawSorted(cmdBuffer, sortedPolys[render_pass], render_pass + 1 < pvrrc.render_passes.used());
 			}
 			else
 			{
@@ -442,7 +465,7 @@ vk::CommandBuffer TextureDrawer::BeginRenderPass()
 			break;
 		}
 
-		TSP tsp = { 0 };
+		TSP tsp = { { 0 } };
 		for (tsp.TexU = 0; tsp.TexU <= 7 && (8u << tsp.TexU) < origWidth; tsp.TexU++);
 		for (tsp.TexV = 0; tsp.TexV <= 7 && (8u << tsp.TexV) < origHeight; tsp.TexV++);
 

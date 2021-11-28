@@ -96,6 +96,7 @@ Option<bool> VSync("rend.vsync", true);
 Option<u64> PixelBufferSize("rend.PixelBufferSize", 512 * 1024 * 1024);
 Option<int> AnisotropicFiltering("rend.AnisotropicFiltering", 1);
 Option<bool> ThreadedRendering("rend.ThreadedRendering", true);
+Option<bool> DupeFrames("rend.DupeFrames", false);
 
 // Misc
 
@@ -157,6 +158,10 @@ std::array<std::array<Option<MapleDeviceType>, 2>, 4> MapleExpansionDevices {
 };
 #ifdef _WIN32
 Option<bool> UseRawInput("RawInput", false, "input");
+#endif
+
+#ifdef USE_LUA
+OptionString LuaFileName("LuaFileName", "flycast.lua");
 #endif
 
 } // namespace config

@@ -60,7 +60,7 @@ static void getLocalInput(MapleInputState inputState[4])
 
 }
 
-#ifndef LIBRETRO
+#ifdef USE_GGPO
 #include "ggponet.h"
 #include "emulator.h"
 #include "rend/gui.h"
@@ -272,15 +272,14 @@ static bool load_game_state(unsigned char *buffer, int len)
 	INFO_LOG(NETWORK, "load_game_state");
 
 	rend_start_rollback();
-	// FIXME will invalidate too much stuff: palette/fog textures, maple stuff
 	// FIXME dynarecs
-	int frame = *(u32 *)buffer;
-	unsigned usedLen = sizeof(u32);
-	buffer += usedLen;
-	dc_unserialize((void **)&buffer, &usedLen, true);
-	if (len != (int)usedLen)
+	Deserializer deser(buffer, len, true);
+	int frame;
+	deser >> frame;
+	dc_deserialize(deser);
+	if (deser.size() != (u32)len)
 	{
-		ERROR_LOG(NETWORK, "load_game_state len %d used %d", len, usedLen);
+		ERROR_LOG(NETWORK, "load_game_state len %d used %d", len, (int)deser.size());
 		die("fatal");
 	}
 	for (int f = lastSavedFrame - 1; f >= frame; f--)
@@ -319,13 +318,11 @@ static bool save_game_state(unsigned char **buffer, int *len, int *checksum, int
 		*len = 0;
 		return false;
 	}
-	u8 *data = *buffer;
-	*(u32 *)data = frame;
-	unsigned usedSize = sizeof(frame);
-	data += usedSize;
-	dc_serialize((void **)&data, &usedSize, true);
-	verify(usedSize < allocSize);
-	*len = usedSize;
+	Serializer ser(*buffer, allocSize, true);
+	ser << frame;
+	dc_serialize(ser);
+	verify(ser.size() < allocSize);
+	*len = ser.size();
 #ifdef SYNC_TEST
 	*checksum = XXH32(*buffer, usedSize, 7);
 #endif
@@ -680,40 +677,40 @@ bool nextFrame()
 		if (!config::ThreadedRendering)
 			UpdateInputState();
 		Inputs inputs;
-		inputs.kcode = ~kcode[localPlayerNum];
-		if (rt[localPlayerNum] >= 64)
+		inputs.kcode = ~kcode[0];
+		if (rt[0] >= 64)
 			inputs.kcode |= BTN_TRIGGER_RIGHT;
 		else
 			inputs.kcode &= ~BTN_TRIGGER_RIGHT;
-		if (lt[localPlayerNum] >= 64)
+		if (lt[0] >= 64)
 			inputs.kcode |= BTN_TRIGGER_LEFT;
 		else
 			inputs.kcode &= ~BTN_TRIGGER_LEFT;
 		if (analogAxes > 0)
 		{
-			inputs.u.analog.x = joyx[localPlayerNum];
+			inputs.u.analog.x = joyx[0];
 			if (analogAxes >= 2)
-				inputs.u.analog.y = joyy[localPlayerNum];
+				inputs.u.analog.y = joyy[0];
 		}
 		else if (absPointerPos)
 		{
-			inputs.u.absPos.x = mo_x_abs[localPlayerNum];
-			inputs.u.absPos.y = mo_y_abs[localPlayerNum];
+			inputs.u.absPos.x = mo_x_abs[0];
+			inputs.u.absPos.y = mo_y_abs[0];
 		}
 		else if (keyboardGame)
 		{
-			inputs.kbModifiers = kb_shift[localPlayerNum];
-			memcpy(inputs.u.keys, kb_key[localPlayerNum], sizeof(kb_key[localPlayerNum]));
+			inputs.kbModifiers = kb_shift[0];
+			memcpy(inputs.u.keys, kb_key[0], sizeof(kb_key[0]));
 		}
 		else if (mouseGame)
 		{
-			inputs.mouseButtons = ~mo_buttons[localPlayerNum];
-			inputs.u.relPos.x = std::round(mo_x_delta[localPlayerNum]);
-			inputs.u.relPos.y = std::round(mo_y_delta[localPlayerNum]);
-			inputs.u.relPos.wheel = std::round(mo_wheel_delta[localPlayerNum]);
-			mo_x_delta[localPlayerNum] -= inputs.u.relPos.x;
-			mo_y_delta[localPlayerNum] -= inputs.u.relPos.y;
-			mo_wheel_delta[localPlayerNum] -= inputs.u.relPos.wheel;
+			inputs.mouseButtons = ~mo_buttons[0];
+			inputs.u.relPos.x = std::round(mo_x_delta[0]);
+			inputs.u.relPos.y = std::round(mo_y_delta[0]);
+			inputs.u.relPos.wheel = std::round(mo_wheel_delta[0]);
+			mo_x_delta[0] -= inputs.u.relPos.x;
+			mo_y_delta[0] -= inputs.u.relPos.y;
+			mo_wheel_delta[0] -= inputs.u.relPos.wheel;
 		}
 		GGPOErrorCode result = ggpo_add_local_input(ggpoSession, localPlayer, &inputs, inputSize);
 		if (result == GGPO_OK)
@@ -808,7 +805,7 @@ void displayStats()
 	ImGui::SetNextWindowPos(ImVec2(10, 10));
 	ImGui::SetNextWindowSize(ImVec2(95 * scaling, 0));
 	ImGui::SetNextWindowBgAlpha(0.7f);
-	ImGui::Begin("", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs);
+	ImGui::Begin("##ggpostats", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs);
 	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.557f, 0.268f, 0.965f, 1.f));
 
 	// Send Queue

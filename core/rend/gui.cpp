@@ -25,7 +25,6 @@
 #include "hw/maple/maple_devs.h"
 #include "hw/naomi/naomi_cart.h"
 #include "imgui/imgui.h"
-#include "gles/imgui_impl_opengl3.h"
 #include "imgui/roboto_medium.h"
 #include "network/net_handshake.h"
 #include "network/ggpo.h"
@@ -44,11 +43,13 @@
 #include "rend/mainui.h"
 #include "lua/lua.h"
 #include "gui_chat.h"
+#include "imgui_driver.h"
 
 static bool game_started;
 
 int screen_dpi = 96;
 int insetLeft, insetRight, insetTop, insetBottom;
+std::unique_ptr<ImGuiDriver> imguiDriver;
 
 static bool inited = false;
 float scaling = 1;
@@ -64,17 +65,14 @@ static double osd_message_end;
 static std::mutex osd_message_mutex;
 
 static int map_system = 0;
-static void display_vmus();
 static void reset_vmus();
-static void term_vmus();
-static void displayCrosshairs();
 void error_popup();
 
 static GameScanner scanner;
 static BackgroundGameLoader gameLoader;
 static Chat chat;
 
-static void emuEventCallback(Event event)
+static void emuEventCallback(Event event, void *)
 {
 	switch (event)
 	{
@@ -82,6 +80,7 @@ static void emuEventCallback(Event event)
 		game_started = true;
 		break;
 	case Event::Start:
+	case Event::Terminate:
 		GamepadDevice::load_system_mappings();
 		break;
 	default:
@@ -138,10 +137,6 @@ void gui_init()
     ImGui::GetStyle().TouchExtraPadding = ImVec2(1, 1);	// from 0,0
 #endif
 
-    // Setup Platform/Renderer bindings
-    if (config::RendererType.isOpenGL())
-    	ImGui_ImplOpenGL3_Init();
-
     // Load Fonts
     // - If no fonts are loaded, dear imgui will use the default font. You can also load multiple fonts and use ImGui::PushFont()/PopFont() to select them.
     // - AddFontFromFileTTF() will return the ImFont* so you can store it if you need to select the font among multiple.
@@ -156,7 +151,7 @@ void gui_init()
     //io.Fonts->AddFontFromFileTTF("../../misc/fonts/ProggyTiny.ttf", 10.0f);
     //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
     //IM_ASSERT(font != NULL);
-#if !(defined(_WIN32) || defined(__APPLE__) || defined(__SWITCH__)) || defined(TARGET_IPHONE)
+#if !defined(_WIN32) && !defined(__SWITCH__)
     scaling = std::max(1.f, screen_dpi / 100.f * 0.75f);
    	// Limit scaling on small low-res screens
     if (settings.display.width <= 640 || settings.display.height <= 480)
@@ -260,6 +255,7 @@ void gui_init()
 
     EventManager::listen(Event::Resume, emuEventCallback);
     EventManager::listen(Event::Start, emuEventCallback);
+	EventManager::listen(Event::Terminate, emuEventCallback);
     ggpo::receiveChatMessages([](int playerNum, const std::string& msg) { chat.receive(playerNum, msg); });
 }
 
@@ -301,8 +297,8 @@ bool gui_mouse_captured()
 
 void gui_set_mouse_position(int x, int y)
 {
-	mouseX = x;
-	mouseY = y;
+	mouseX = std::round(x * settings.display.pointScale);
+	mouseY = std::round(y * settings.display.pointScale);
 }
 
 void gui_set_mouse_button(int button, bool pressed)
@@ -320,12 +316,7 @@ void gui_set_mouse_wheel(float delta)
 
 static void ImGui_Impl_NewFrame()
 {
-	if (config::RendererType.isOpenGL())
-		ImGui_ImplOpenGL3_NewFrame();
-#ifdef _WIN32
-	else if (config::RendererType.isDirectX())
-		ImGui_ImplDX9_NewFrame();
-#endif
+	imguiDriver->newFrame();
 	ImGui::GetIO().DisplaySize.x = settings.display.width;
 	ImGui::GetIO().DisplaySize.y = settings.display.height;
 
@@ -410,7 +401,17 @@ void gui_open_settings()
 		{
 			gui_state = GuiState::Commands;
 			HideOSD();
-			emu.stop();
+#ifdef TARGET_UWP
+			if (config::ThreadedRendering)
+			{
+				static std::future<void> f;
+				f = std::async(std::launch::async, [] {
+					emu.stop();
+				});
+			}
+			else
+#endif
+				emu.stop();
 		}
 		else
 			chat.toggle();
@@ -422,7 +423,6 @@ void gui_open_settings()
 	else if (gui_state == GuiState::Loading)
 	{
 		gameLoader.cancel();
-		gui_state = GuiState::Main;
 	}
 	else if (gui_state == GuiState::Commands)
 	{
@@ -466,7 +466,7 @@ void gui_stop_game(const std::string& message)
 
 static void gui_display_commands()
 {
-   	display_vmus();
+   	imguiDriver->displayVmus();
 
     centerNextWindow();
     ImGui::SetNextWindowSize(ImVec2(330 * scaling, 0));
@@ -888,16 +888,23 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 	if (ImGui::BeginPopupModal("Controller Mapping", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
 	{
 		const ImGuiStyle& style = ImGui::GetStyle();
-		const float width = ImGui::GetIO().DisplaySize.x - insetLeft - insetRight - (style.WindowBorderSize + style.WindowPadding.x) * 2;
-		const float col_width = (width - style.GrabMinSize - style.ItemSpacing.x
+		const float winWidth = ImGui::GetIO().DisplaySize.x - insetLeft - insetRight - (style.WindowBorderSize + style.WindowPadding.x) * 2;
+		const float col_width = (winWidth - style.GrabMinSize - style.ItemSpacing.x
 				- (ImGui::CalcTextSize("Map").x + style.FramePadding.x * 2.0f + style.ItemSpacing.x)
 				- (ImGui::CalcTextSize("Unmap").x + style.FramePadding.x * 2.0f + style.ItemSpacing.x)) / 2;
+
+		static int item_current_map_idx = 0;
+		static int last_item_current_map_idx = 2;
 
 		std::shared_ptr<InputMapping> input_mapping = gamepad->get_input_mapping();
 		if (input_mapping == NULL || ImGui::Button("Done", ImVec2(100 * scaling, 30 * scaling)))
 		{
 			ImGui::CloseCurrentPopup();
 			gamepad->save_mapping(map_system);
+			last_item_current_map_idx = 2;
+			ImGui::EndPopup();
+			ImGui::PopStyleVar();
+			return;
 		}
 		ImGui::SetItemDefaultFocus();
 
@@ -923,11 +930,32 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 			portWidth += ImGui::CalcTextSize("Port").x + ImGui::GetStyle().ItemSpacing.x + ImGui::GetStyle().FramePadding.x;
 			ImGui::PopStyleVar();
 		}
-		float comboWidth = ImGui::CalcTextSize("Dreamcast Controls").x + ImGui::GetStyle().ItemSpacing.x * 3.0f + ImGui::GetFontSize();
-		ImGui::SameLine(0, ImGui::GetContentRegionAvail().x - comboWidth - ImGui::GetStyle().ItemSpacing.x - 100 * scaling * 2 - portWidth);
+		float comboWidth = ImGui::CalcTextSize("Dreamcast Controls").x + ImGui::GetStyle().ItemSpacing.x + ImGui::GetFontSize() + ImGui::GetStyle().FramePadding.x * 4;
+		float gameConfigWidth = 0;
+		if (!settings.content.gameId.empty())
+			gameConfigWidth = ImGui::CalcTextSize(gamepad->isPerGameMapping() ? "Delete Game Config" : "Make Game Config").x + ImGui::GetStyle().ItemSpacing.x + ImGui::GetStyle().FramePadding.x * 2;
+		ImGui::SameLine(0, ImGui::GetContentRegionAvail().x - comboWidth - gameConfigWidth - ImGui::GetStyle().ItemSpacing.x - 100 * scaling * 2 - portWidth);
 
 		ImGui::AlignTextToFramePadding();
 
+		if (!settings.content.gameId.empty())
+		{
+			if (gamepad->isPerGameMapping())
+			{
+				if (ImGui::Button("Delete Game Config", ImVec2(0, 30 * scaling)))
+				{
+					gamepad->setPerGameMapping(false);
+					if (!gamepad->find_mapping(map_system))
+						gamepad->resetMappingToDefault(arcade_button_mode, true);
+				}
+			}
+			else
+			{
+				if (ImGui::Button("Make Game Config", ImVec2(0, 30 * scaling)))
+					gamepad->setPerGameMapping(true);
+			}
+			ImGui::SameLine();
+		}
 		if (ImGui::Button("Reset...", ImVec2(100 * scaling, 30 * scaling)))
 			ImGui::OpenPopup("Confirm Reset");
 
@@ -966,8 +994,6 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 		ImGui::SameLine();
 
 		const char* items[] = { "Dreamcast Controls", "Arcade Controls" };
-		static int item_current_map_idx = 0;
-		static int last_item_current_map_idx = 2;
 
 		// Here our selection data is an index.
 
@@ -976,7 +1002,7 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, (30 * scaling - ImGui::GetFontSize()) / 2));
 		ImGui::Combo("##arcadeMode", &item_current_map_idx, items, IM_ARRAYSIZE(items));
 		ImGui::PopStyleVar();
-		if (item_current_map_idx != last_item_current_map_idx)
+		if (last_item_current_map_idx != 2 && item_current_map_idx != last_item_current_map_idx)
 		{
 			gamepad->save_mapping(map_system);
 		}
@@ -996,7 +1022,9 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 
 		if (item_current_map_idx != last_item_current_map_idx)
 		{
-			gamepad->find_mapping(map_system);
+			if (!gamepad->find_mapping(map_system))
+				if (map_system == DC_PLATFORM_DREAMCAST || !gamepad->find_mapping(DC_PLATFORM_DREAMCAST))
+					gamepad->resetMappingToDefault(arcade_button_mode, true);
 			input_mapping = gamepad->get_input_mapping();
 
 			last_item_current_map_idx = item_current_map_idx;
@@ -1006,7 +1034,6 @@ static void controller_mapping_popup(const std::shared_ptr<GamepadDevice>& gamep
 
 		ImGui::BeginChildFrame(ImGui::GetID("buttons"), ImVec2(0, 0), ImGuiWindowFlags_None);
 
-		gamepad->find_mapping(map_system);
 		for (; systemMapping->name != nullptr; systemMapping++)
 		{
 			if (systemMapping->key == EMU_BTN_NONE)
@@ -1378,7 +1405,6 @@ static void gui_display_settings()
 					if (gamepad->remappable() && ImGui::Button("Map"))
 					{
 						gamepad_port = 0;
-						gamepad->verify_or_create_system_mappings();
 						ImGui::OpenPopup("Controller Mapping");
 					}
 
@@ -1404,7 +1430,7 @@ static void gui_display_settings()
 
 	    	ImGui::Spacing();
 	    	OptionSlider("Mouse sensitivity", config::MouseSensitivity, 1, 500);
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TARGET_UWP)
 	    	OptionCheckbox("Use Raw Input", config::UseRawInput, "Supports multiple pointing devices (mice, light guns) and keyboards");
 #endif
 
@@ -1525,20 +1551,14 @@ static void gui_display_settings()
 				renderApi = 2;
 				perPixel = false;
 				break;
+			case RenderType::DirectX11:
+				renderApi = 3;
+				perPixel = false;
+				break;
 			}
 
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, normal_padding);
-#if !defined(__APPLE__)
-			bool has_per_pixel = false;
-			if (renderApi == 0)
-				has_per_pixel = !theGLContext.IsGLES() && theGLContext.GetMajorVersion() >= 4;
-#ifdef USE_VULKAN
-			else
-				has_per_pixel = VulkanContext::Instance()->SupportsFragmentShaderStoresAndAtomics();
-#endif
-#else
-			bool has_per_pixel = false;
-#endif
+			const bool has_per_pixel = GraphicsContext::Instance()->hasPerPixel();
 		    header("Transparent Sorting");
 		    {
 		    	int renderer = perPixel ? 2 : config::PerStripSorting ? 1 : 0;
@@ -1609,17 +1629,35 @@ static void gui_display_settings()
 #ifndef TARGET_IPHONE
 		    	OptionCheckbox("VSync", config::VSync, "Synchronizes the frame rate with the screen refresh rate. Recommended");
 #endif
+		    	ImGui::Indent();
+		    	if (!config::VSync || !isVulkan(config::RendererType))
+		    	{
+			        ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+			        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+		    	}
+	    		OptionCheckbox("Duplicate frames", config::DupeFrames, "Duplicate frames on high refresh rate monitors (120 Hz and higher)");
+		    	if (!config::VSync || !isVulkan(config::RendererType))
+		    	{
+			        ImGui::PopItemFlag();
+			        ImGui::PopStyleVar();
+		    	}
+		    	ImGui::Unindent();
 		    	OptionCheckbox("Show FPS Counter", config::ShowFPS, "Show on-screen frame/sec counter");
 		    	OptionCheckbox("Show VMU In-game", config::FloatVMUs, "Show the VMU LCD screens while in-game");
 		    	OptionCheckbox("Rotate Screen 90°", config::Rotate90, "Rotate the screen 90° counterclockwise");
 		    	OptionCheckbox("Delay Frame Swapping", config::DelayFrameSwapping,
 		    			"Useful to avoid flashing screen or glitchy videos. Not recommended on slow platforms");
-#if defined(USE_VULKAN) || defined(_WIN32)
+#if defined(USE_VULKAN) || defined(USE_DX9) || defined(_WIN32)
 		    	ImGui::Text("Graphics API:");
-#if defined(USE_VULKAN) && defined(_WIN32)
-	            constexpr u32 columns = 3;
-#else
-	            constexpr u32 columns = 2;
+		    	u32 columns = 1;
+#ifdef USE_VULKAN
+	            columns++;
+#endif
+#ifdef _WIN32
+	            columns++;
+#ifdef USE_DX9
+	            columns++;
+#endif
 #endif
 	            ImGui::Columns(columns, "renderApi", false);
 		    	ImGui::RadioButton("Open GL", &renderApi, 0);
@@ -1629,7 +1667,11 @@ static void gui_display_settings()
             	ImGui::NextColumn();
 #endif
 #ifdef _WIN32
-		    	ImGui::RadioButton("DirectX", &renderApi, 2);
+#ifdef USE_DX9
+		    	ImGui::RadioButton("DirectX 9", &renderApi, 2);
+            	ImGui::NextColumn();
+#endif
+		    	ImGui::RadioButton("DirectX 11", &renderApi, 3);
             	ImGui::NextColumn();
 #endif
 		    	ImGui::Columns(1, NULL, false);
@@ -1725,6 +1767,9 @@ static void gui_display_settings()
 		    	break;
 		    case 2:
 		    	config::RendererType = RenderType::DirectX9;
+		    	break;
+		    case 3:
+		    	config::RendererType = RenderType::DirectX11;
 		    	break;
 		    }
 		}
@@ -1936,6 +1981,20 @@ static void gui_display_settings()
 		    }
 			ImGui::PopStyleVar();
 			ImGui::EndTabItem();
+
+			#ifdef USE_LUA
+			header("Lua Scripting");
+			{
+				char LuaFileName[256];
+
+				strcpy(LuaFileName, config::LuaFileName.get().c_str());
+				ImGui::InputText("Lua Filename", LuaFileName, sizeof(LuaFileName), ImGuiInputTextFlags_CharsNoBlank, nullptr, nullptr);
+				ImGui::SameLine();
+				ShowHelpMarker("Specify lua filename to use. Should be located in Flycasts root directory. Defaults to flycast.lua when empty.");
+				config::LuaFileName = LuaFileName;
+
+			}
+			#endif
 		}
 		if (ImGui::BeginTabItem("About"))
 		{
@@ -1977,6 +2036,8 @@ static void gui_display_settings()
 #else
 					"macOS"
 #endif
+#elif defined(TARGET_UWP)
+					"Windows Universal Platform"
 #elif defined(_WIN32)
 					"Windows"
 #elif defined(__SWITCH__)
@@ -1991,34 +2052,14 @@ static void gui_display_settings()
 #endif
 		    }
 	    	ImGui::Spacing();
-	    	if (config::RendererType.isOpenGL())
-	    	{
+	    	if (isOpenGL(config::RendererType))
 				header("Open GL");
-	    		ImGui::Text("Renderer: %s", (const char *)glGetString(GL_RENDERER));
-	    		ImGui::Text("Version: %s", (const char *)glGetString(GL_VERSION));
-	    	}
-#ifdef USE_VULKAN
-	    	else if (config::RendererType.isVulkan())
-	    	{
+	    	else if (isVulkan(config::RendererType))
 				header("Vulkan");
-				std::string name = VulkanContext::Instance()->GetDriverName();
-				ImGui::Text("Driver Name: %s", name.c_str());
-				std::string version = VulkanContext::Instance()->GetDriverVersion();
-				ImGui::Text("Version: %s", version.c_str());
-	    	}
-#endif
-#ifdef _WIN32
-	    	else if (config::RendererType.isDirectX())
-	    	{
-				if (ImGui::CollapsingHeader("DirectX", ImGuiTreeNodeFlags_DefaultOpen))
-				{
-		    		std::string name = theDXContext.getDriverName();
-		    		ImGui::Text("Driver Name: %s", name.c_str());
-		    		std::string version = theDXContext.getDriverVersion();
-		    		ImGui::Text("Version: %s", version.c_str());
-				}
-	    	}
-#endif
+	    	else if (isDirectX(config::RendererType))
+				header("DirectX");
+			ImGui::Text("Driver Name: %s", GraphicsContext::Instance()->getDriverName().c_str());
+			ImGui::Text("Version: %s", GraphicsContext::Instance()->getDriverVersion().c_str());
 
 #ifdef __ANDROID__
 		    ImGui::Separator();
@@ -2075,13 +2116,21 @@ static void gui_display_content()
     ImGui::Unindent(10 * scaling);
 
     static ImGuiTextFilter filter;
-#if !defined(__ANDROID__) && !defined(TARGET_IPHONE)
+#if !defined(__ANDROID__) && !defined(TARGET_IPHONE) && !defined(TARGET_UWP)
 	ImGui::SameLine(0, 32 * scaling);
 	filter.Draw("Filter");
 #endif
     if (gui_state != GuiState::SelectDisk)
     {
+#ifdef TARGET_UWP
+    	void gui_load_game();
+		ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::CalcTextSize("Settings").x - ImGui::GetStyle().FramePadding.x * 4.0f  - ImGui::GetStyle().ItemSpacing.x - ImGui::CalcTextSize("Load...").x);
+		if (ImGui::Button("Load..."))
+			gui_load_game();
+		ImGui::SameLine();
+#else
 		ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::CalcTextSize("Settings").x - ImGui::GetStyle().FramePadding.x * 2.0f);
+#endif
 		if (ImGui::Button("Settings"))
 			gui_state = GuiState::Settings;
     }
@@ -2258,12 +2307,25 @@ static void gui_network_start()
 	if (ImGui::Button("Cancel", ImVec2(100.f * scaling, 0.f)))
 	{
 		NetworkHandshake::instance->stop();
+#ifdef TARGET_UWP
+		static std::future<void> f;
+		f = std::async(std::launch::async, [] {
+			try {
+				networkStatus.get();
+			}
+			catch (const FlycastException& e) {
+			}
+			emu.unloadGame();
+			gui_state = GuiState::Main;
+		});
+#else
 		try {
 			networkStatus.get();
 		} catch (const FlycastException& e) {
 		}
 		gui_state = GuiState::Main;
 		emu.unloadGame();
+#endif
 	}
 	ImGui::PopStyleVar();
 
@@ -2311,10 +2373,7 @@ static void gui_display_loadscreen()
 			ImGui::SetCursorPosX((currentwidth - 100.f * scaling) / 2.f + ImGui::GetStyle().WindowPadding.x);
 			ImGui::SetCursorPosY(126.f * scaling);
 			if (ImGui::Button("Cancel", ImVec2(100.f * scaling, 0.f)))
-			{
 				gameLoader.cancel();
-				gui_state = GuiState::Main;
-			}
 		}
 	} catch (const FlycastException& ex) {
 		ERROR_LOG(BOOT, "%s", ex.what());
@@ -2392,7 +2451,7 @@ void gui_display_ui()
 	}
 	error_popup();
     ImGui::Render();
-    ImGui_impl_RenderDrawData(ImGui::GetDrawData());
+    imguiDriver->renderDrawData(ImGui::GetDrawData());
 
 	if (gui_state == GuiState::Closed)
 		emu.start();
@@ -2447,9 +2506,9 @@ void gui_display_osd()
 			ImGui::TextColored(ImVec4(1, 1, 0, 0.7), "%s", message.c_str());
 			ImGui::End();
 		}
-		displayCrosshairs();
+		imguiDriver->displayCrosshairs();
 		if (config::FloatVMUs)
-			display_vmus();
+			imguiDriver->displayVmus();
 //		gui_plot_render_time(settings.display.width, settings.display.height);
 		if (ggpo::active())
 		{
@@ -2460,7 +2519,7 @@ void gui_display_osd()
 		lua::overlay();
 
 		ImGui::Render();
-		ImGui_impl_RenderDrawData(ImGui::GetDrawData());
+		imguiDriver->renderDrawData(ImGui::GetDrawData());
 	}
 }
 
@@ -2479,12 +2538,10 @@ void gui_term()
 	if (inited)
 	{
 		inited = false;
-		term_vmus();
-		if (config::RendererType.isOpenGL())
-			ImGui_ImplOpenGL3_Shutdown();
 		ImGui::DestroyContext();
 	    EventManager::unlisten(Event::Resume, emuEventCallback);
 	    EventManager::unlisten(Event::Start, emuEventCallback);
+	    EventManager::unlisten(Event::Terminate, emuEventCallback);
 	}
 }
 
@@ -2510,150 +2567,10 @@ void gui_refresh_files()
 	subfolders_read = false;
 }
 
-#define VMU_WIDTH (70 * 48 * scaling / 32)
-#define VMU_HEIGHT (70 * scaling)
-#define VMU_PADDING (8 * scaling)
-static ImTextureID vmu_lcd_tex_ids[8];
-
-static ImTextureID crosshairTexId;
-
-static const int vmu_coords[8][2] = {
-		{ 0 , 0 },
-		{ 0 , 0 },
-		{ 1 , 0 },
-		{ 1 , 0 },
-		{ 0 , 1 },
-		{ 0 , 1 },
-		{ 1 , 1 },
-		{ 1 , 1 },
-};
-
-static void display_vmus()
-{
-	if (!game_started)
-		return;
-	if (!config::RendererType.isOpenGL())
-		return;
-    ImGui::SetNextWindowBgAlpha(0);
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-
-    ImGui::Begin("vmu-window", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs
-    		| ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing);
-	for (int i = 0; i < 8; i++)
-	{
-		if (!vmu_lcd_status[i])
-			continue;
-
-		if (vmu_lcd_tex_ids[i] != (ImTextureID)0)
-			ImGui_ImplOpenGL3_DeleteTexture(vmu_lcd_tex_ids[i]);
-		vmu_lcd_tex_ids[i] = ImGui_ImplOpenGL3_CreateVmuTexture(vmu_lcd_data[i]);
-
-	    int x = vmu_coords[i][0];
-	    int y = vmu_coords[i][1];
-	    ImVec2 pos;
-	    if (x == 0)
-	    	pos.x = VMU_PADDING;
-	    else
-	    	pos.x = ImGui::GetIO().DisplaySize.x - VMU_WIDTH - VMU_PADDING;
-	    if (y == 0)
-	    {
-	    	pos.y = VMU_PADDING;
-	    	if (i & 1)
-	    		pos.y += VMU_HEIGHT + VMU_PADDING;
-	    }
-	    else
-	    {
-	    	pos.y = ImGui::GetIO().DisplaySize.y - VMU_HEIGHT - VMU_PADDING;
-	    	if (i & 1)
-	    		pos.y -= VMU_HEIGHT + VMU_PADDING;
-	    }
-	    ImVec2 pos_b(pos.x + VMU_WIDTH, pos.y + VMU_HEIGHT);
-		ImGui::GetWindowDrawList()->AddImage(vmu_lcd_tex_ids[i], pos, pos_b, ImVec2(0, 1), ImVec2(1, 0), 0xC0ffffff);
-	}
-    ImGui::End();
-}
-
-std::pair<float, float> getCrosshairPosition(int playerNum)
-{
-	float fx = mo_x_abs[playerNum];
-	float fy = mo_y_abs[playerNum];
-	float width = 640.f;
-	float height = 480.f;
-
-	if (config::Rotate90)
-	{
-		float t = fy;
-		fy = 639.f - fx;
-		fx = t;
-		std::swap(width, height);
-	}
-	float scale = height / settings.display.height;
-	fy /= scale;
-	scale /= config::ScreenStretching / 100.f;
-	fx = fx / scale + (settings.display.width - width / scale) / 2.f;
-
-	return std::make_pair(fx, fy);
-}
-
-static void displayCrosshairs()
-{
-	if (!game_started)
-		return;
-	if (!config::RendererType.isOpenGL())
-		return;
-	if (!crosshairsNeeded())
-		return;
-
-	if (crosshairTexId == ImTextureID())
-		crosshairTexId = ImGui_ImplOpenGL3_CreateCrosshairTexture(getCrosshairTextureData());
-    ImGui::SetNextWindowBgAlpha(0);
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-
-    ImGui::Begin("xhair-window", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs
-    		| ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing);
-	for (u32 i = 0; i < config::CrosshairColor.size(); i++)
-	{
-		if (config::CrosshairColor[i] == 0)
-			continue;
-		if (settings.platform.system == DC_PLATFORM_DREAMCAST && config::MapleMainDevices[i] != MDT_LightGun)
-			continue;
-
-		ImVec2 pos;
-		std::tie(pos.x, pos.y) = getCrosshairPosition(i);
-		pos.x -= (XHAIR_WIDTH * scaling) / 2.f;
-		pos.y += (XHAIR_WIDTH * scaling) / 2.f;
-		ImVec2 pos_b(pos.x + XHAIR_WIDTH * scaling, pos.y - XHAIR_HEIGHT * scaling);
-
-		ImGui::GetWindowDrawList()->AddImage(crosshairTexId, pos, pos_b, ImVec2(0, 1), ImVec2(1, 0), config::CrosshairColor[i]);
-	}
-	ImGui::End();
-}
-
 static void reset_vmus()
 {
 	for (u32 i = 0; i < ARRAY_SIZE(vmu_lcd_status); i++)
 		vmu_lcd_status[i] = false;
-}
-
-static void term_vmus()
-{
-	if (!config::RendererType.isOpenGL())
-		return;
-	for (u32 i = 0; i < ARRAY_SIZE(vmu_lcd_status); i++)
-	{
-		if (vmu_lcd_tex_ids[i] != ImTextureID())
-		{
-			ImGui_ImplOpenGL3_DeleteTexture(vmu_lcd_tex_ids[i]);
-			vmu_lcd_tex_ids[i] = ImTextureID();
-		}
-	}
-	if (crosshairTexId != ImTextureID())
-	{
-		ImGui_ImplOpenGL3_DeleteTexture(crosshairTexId);
-		crosshairTexId = ImTextureID();
-	}
 }
 
 void gui_error(const std::string& what)

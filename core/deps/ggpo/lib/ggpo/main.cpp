@@ -14,7 +14,7 @@
 struct Init
 {
 	Init() {
-		srand(Platform::GetCurrentTimeMS() + Platform::GetProcessID());
+		srand(GGPOPlatform::GetCurrentTimeMS() + GGPOPlatform::GetProcessID());
 #ifdef _WIN32
 		WSADATA wsaData;
 		WSAStartup(MAKEWORD(2, 0), &wsaData);
@@ -180,19 +180,6 @@ ggpo_advance_frame(GGPOSession *ggpo)
 	   return ggpo->IncrementFrame();
    } catch (const GGPOException& e) {
 	   Log("GGPOException in ggpo_advance_frame: %s", e.what());
-	   return e.ggpoError;
-   }
-}
-
-GGPOErrorCode
-ggpo_client_chat(GGPOSession *ggpo, char *text)
-{
-   if (!ggpo)
-      return GGPO_ERRORCODE_INVALID_SESSION;
-   try {
-	   return ggpo->Chat(text);
-   } catch (const GGPOException& e) {
-	   Log("GGPOException in ggpo_client_chat: %s", e.what());
 	   return e.ggpoError;
    }
 }

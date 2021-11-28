@@ -24,6 +24,7 @@ if(APPLE)
 	if(CMAKE_SYSTEM_NAME STREQUAL iOS)
 		set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum iOS deployment version")
 		set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "")
+		set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
 	else()
 		set(CMAKE_OSX_DEPLOYMENT_TARGET "10.9" CACHE STRING "Minimum macOS deployment version")
 		set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "")
@@ -53,6 +54,17 @@ if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
         OUTPUT_VARIABLE GIT_HASH
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
+    if(WINDOWS_STORE)
+	    string(REPLACE "v" "" MS_VERSION ${GIT_VERSION})
+	    string(REPLACE "-" "." MS_VERSION  ${MS_VERSION})
+	    string(REGEX REPLACE "\.g[0-9a-f]+" "" MS_VERSION  ${MS_VERSION})
+	    string(REGEX MATCH "[0-9]+\.[0-9]+\.[0-9]+" VERSION_3PARTS ${MS_VERSION})
+	    if (VERSION_3PARTS STREQUAL "")
+	    	string(APPEND MS_VERSION ".0.0")
+	    else()
+	    	string(APPEND MS_VERSION ".0")
+	    endif()
+    endif()
 endif()
 
 string(TIMESTAMP BUILD_TIMESTAMP UTC)
@@ -115,16 +127,28 @@ else()
     add_executable(${PROJECT_NAME} MACOSX_BUNDLE core/emulator.cpp)
 endif()
 
-target_compile_features(${PROJECT_NAME} PRIVATE c_std_11 cxx_std_11)
+if(WINDOWS_STORE)
+    target_compile_features(${PROJECT_NAME} PRIVATE c_std_11 cxx_std_17)
+else()
+    target_compile_features(${PROJECT_NAME} PRIVATE c_std_11 cxx_std_11)
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES
 	CXX_EXTENSIONS OFF
 	LINK_FLAGS_RELEASE -s)
 if(MSVC)
 	target_compile_options(${PROJECT_NAME} PRIVATE /GR- /GS-)
+	if(WINDOWS_STORE)
+		target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00)
+		target_compile_options(${PROJECT_NAME} PRIVATE /ZW)
+	endif()
 else()
 	target_compile_options(${PROJECT_NAME} PRIVATE
 		$<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>
 		$<$<COMPILE_LANGUAGE:CXX>:-Wall>)
+	if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+		target_compile_options(${PROJECT_NAME} PRIVATE
+			$<$<COMPILE_LANGUAGE:CXX>:-Wno-nullability-completeness>)
+	endif()
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -197,7 +221,7 @@ option(BUILD_SHARED_LIBS "Build shared library" OFF)
 add_subdirectory(core/deps/glm)
 target_link_libraries(${PROJECT_NAME} PRIVATE glm::glm)
 
-if(NOT APPLE AND USE_VULKAN)
+if(USE_VULKAN)
 	option(BUILD_EXTERNAL "Build external dependencies in /External" OFF)
 	add_subdirectory(core/deps/glslang)
 	target_link_libraries(${PROJECT_NAME} PRIVATE SPIRV)
@@ -211,7 +235,7 @@ if(NOT LIBRETRO)
 	    target_link_libraries(${PROJECT_NAME} PRIVATE ${ALSA_LIBRARIES})
 	endif()
 	
-	if(WIN32)
+	if(WIN32 AND NOT WINDOWS_STORE)
 		# Build SDL
 		file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/core/deps/SDL")
 		if(CMAKE_GENERATOR MATCHES "Visual Studio")
@@ -232,7 +256,9 @@ if(NOT LIBRETRO)
 		target_link_libraries(${PROJECT_NAME} PRIVATE "-static-libgcc -static-libstdc++")
 	endif()
 	
-	if((APPLE AND NOT IOS) OR WIN32)
+	if(WINDOWS_STORE)
+		find_package(SDL2 CONFIG REQUIRED)
+	elseif((APPLE AND NOT IOS) OR WIN32)
 	    find_package(SDL2 HINTS "${CMAKE_CURRENT_BINARY_DIR}/core/deps/SDL/cmake")
 	elseif(NOT ANDROID AND NOT IOS)
 	    find_package(SDL2)
@@ -257,13 +283,13 @@ if(NOT LIBRETRO)
 	endif()
 	
 	find_package(ZLIB)
-	if(TARGET ZLIB::ZLIB AND NOT ANDROID AND NOT WIN32)
+	if(TARGET ZLIB::ZLIB AND NOT ANDROID AND (NOT WIN32 OR WINDOWS_STORE))
 	    set(WITH_SYSTEM_ZLIB ON CACHE BOOL "Use system provided zlib library")
 	    target_link_libraries(${PROJECT_NAME} PRIVATE ZLIB::ZLIB)
 	endif()
 	
 	find_package(Lua)
-	if(LUA_FOUND)
+	if(NOT APPLE AND LUA_FOUND)
 		target_compile_definitions(${PROJECT_NAME} PRIVATE USE_LUA)
 	    target_include_directories(${PROJECT_NAME} PRIVATE ${LUA_INCLUDE_DIR} core/deps/luabridge/Source)
 	    list(TRANSFORM LUA_LIBRARIES REPLACE "\.dll" "")
@@ -271,9 +297,7 @@ if(NOT LIBRETRO)
 	endif()
 endif()
 
-execute_process(COMMAND git apply -p1 ${CMAKE_CURRENT_SOURCE_DIR}/core/deps/patches/libchdr.patch
-		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/core/deps/libchdr)
-add_subdirectory(core/deps/libchdr)
+add_subdirectory(core/deps/libchdr EXCLUDE_FROM_ALL)
 target_link_libraries(${PROJECT_NAME} PRIVATE chdr-static)
 target_include_directories(${PROJECT_NAME} PRIVATE core/deps/libchdr/include)
 
@@ -377,6 +401,12 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS} rt)
 endif()
 
+if(WINDOWS_STORE)
+	find_package(unofficial-angle CONFIG REQUIRED)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE GLES GLES3)
+	target_link_libraries(${PROJECT_NAME} PRIVATE unofficial::angle::libEGL unofficial::angle::libGLESv2)
+endif()
+
 if(ASAN)
     target_compile_options(${PROJECT_NAME} PRIVATE -fsanitize=address -static-libasan)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address -static-libasan")
@@ -438,67 +468,65 @@ if(WIN32)
     target_include_directories(${PROJECT_NAME} PRIVATE core/deps/dirent)
 endif()
 
-if(NOT MSVC)
-    target_include_directories(${PROJECT_NAME} PRIVATE core/deps/picotcp/include core/deps/picotcp/modules)
-    target_sources(${PROJECT_NAME} PRIVATE
-            core/deps/picotcp/include/arch/pico_arm9.h
-            core/deps/picotcp/include/arch/pico_atsamd21j18.h
-            core/deps/picotcp/include/arch/pico_avr.h
-            core/deps/picotcp/include/arch/pico_cortex_m.h
-            core/deps/picotcp/include/arch/pico_dos.h
-            core/deps/picotcp/include/arch/pico_esp8266.h
-            core/deps/picotcp/include/arch/pico_generic_gcc.h
-            core/deps/picotcp/include/arch/pico_linux.h
-            core/deps/picotcp/include/arch/pico_mbed.h
-            core/deps/picotcp/include/arch/pico_msp430.h
-            core/deps/picotcp/include/arch/pico_msvc.h
-            core/deps/picotcp/include/arch/pico_none.h
-            core/deps/picotcp/include/arch/pico_pic24.h
-            core/deps/picotcp/include/arch/pico_pic32.h
-            core/deps/picotcp/include/arch/pico_posix.h
-            core/deps/picotcp/include/heap.h
-            core/deps/picotcp/include/pico_addressing.h
-            core/deps/picotcp/include/pico_config.h
-            core/deps/picotcp/include/pico_constants.h
-            core/deps/picotcp/include/pico_defines.h
-            core/deps/picotcp/include/pico_defines_msvc.h
-            core/deps/picotcp/include/pico_device.h
-            core/deps/picotcp/include/pico_eth.h
-            core/deps/picotcp/include/pico_frame.h
-            core/deps/picotcp/include/pico_md5.h
-            core/deps/picotcp/include/pico_module_eth.h
-            core/deps/picotcp/include/pico_protocol.h
-            core/deps/picotcp/include/pico_queue.h
-            core/deps/picotcp/include/pico_socket.h
-            core/deps/picotcp/include/pico_socket_multicast.h
-            core/deps/picotcp/include/pico_stack.h
-            core/deps/picotcp/include/pico_tree.h
-            core/deps/picotcp/modules/pico_arp.c
-            core/deps/picotcp/modules/pico_dev_ppp.c
-            core/deps/picotcp/modules/pico_dhcp_common.c
-            core/deps/picotcp/modules/pico_dhcp_common.h
-            core/deps/picotcp/modules/pico_dhcp_server.c
-            core/deps/picotcp/modules/pico_dhcp_server.h
-            core/deps/picotcp/modules/pico_dns_client.c
-            core/deps/picotcp/modules/pico_dns_common.c
-            core/deps/picotcp/modules/pico_ethernet.c
-            core/deps/picotcp/modules/pico_fragments.c
-            core/deps/picotcp/modules/pico_icmp4.c
-            core/deps/picotcp/modules/pico_ipv4.c
-            core/deps/picotcp/modules/pico_socket_tcp.c
-            core/deps/picotcp/modules/pico_socket_udp.c
-            core/deps/picotcp/modules/pico_strings.c
-            core/deps/picotcp/modules/pico_tcp.c
-            core/deps/picotcp/modules/pico_udp.c
-            core/deps/picotcp/stack/pico_device.c
-            core/deps/picotcp/stack/pico_frame.c
-            core/deps/picotcp/stack/pico_md5.c
-            core/deps/picotcp/stack/pico_protocol.c
-            core/deps/picotcp/stack/pico_socket.c
-            core/deps/picotcp/stack/pico_socket_multicast.c
-            core/deps/picotcp/stack/pico_stack.c
-            core/deps/picotcp/stack/pico_tree.c)
-endif()
+target_include_directories(${PROJECT_NAME} PRIVATE core/deps/picotcp/include core/deps/picotcp/modules)
+target_sources(${PROJECT_NAME} PRIVATE
+        core/deps/picotcp/include/arch/pico_arm9.h
+        core/deps/picotcp/include/arch/pico_atsamd21j18.h
+        core/deps/picotcp/include/arch/pico_avr.h
+        core/deps/picotcp/include/arch/pico_cortex_m.h
+        core/deps/picotcp/include/arch/pico_dos.h
+        core/deps/picotcp/include/arch/pico_esp8266.h
+        core/deps/picotcp/include/arch/pico_generic_gcc.h
+        core/deps/picotcp/include/arch/pico_linux.h
+        core/deps/picotcp/include/arch/pico_mbed.h
+        core/deps/picotcp/include/arch/pico_msp430.h
+        core/deps/picotcp/include/arch/pico_msvc.h
+        core/deps/picotcp/include/arch/pico_none.h
+        core/deps/picotcp/include/arch/pico_pic24.h
+        core/deps/picotcp/include/arch/pico_pic32.h
+        core/deps/picotcp/include/arch/pico_posix.h
+        core/deps/picotcp/include/heap.h
+        core/deps/picotcp/include/pico_addressing.h
+        core/deps/picotcp/include/pico_config.h
+        core/deps/picotcp/include/pico_constants.h
+        core/deps/picotcp/include/pico_defines.h
+        core/deps/picotcp/include/pico_defines_msvc.h
+        core/deps/picotcp/include/pico_device.h
+        core/deps/picotcp/include/pico_eth.h
+        core/deps/picotcp/include/pico_frame.h
+        core/deps/picotcp/include/pico_md5.h
+        core/deps/picotcp/include/pico_module_eth.h
+        core/deps/picotcp/include/pico_protocol.h
+        core/deps/picotcp/include/pico_queue.h
+        core/deps/picotcp/include/pico_socket.h
+        core/deps/picotcp/include/pico_socket_multicast.h
+        core/deps/picotcp/include/pico_stack.h
+        core/deps/picotcp/include/pico_tree.h
+        core/deps/picotcp/modules/pico_arp.c
+        core/deps/picotcp/modules/pico_dev_ppp.c
+        core/deps/picotcp/modules/pico_dhcp_common.c
+        core/deps/picotcp/modules/pico_dhcp_common.h
+        core/deps/picotcp/modules/pico_dhcp_server.c
+        core/deps/picotcp/modules/pico_dhcp_server.h
+        core/deps/picotcp/modules/pico_dns_client.c
+        core/deps/picotcp/modules/pico_dns_common.c
+        core/deps/picotcp/modules/pico_ethernet.c
+        core/deps/picotcp/modules/pico_fragments.c
+        core/deps/picotcp/modules/pico_icmp4.c
+        core/deps/picotcp/modules/pico_ipv4.c
+        core/deps/picotcp/modules/pico_socket_tcp.c
+        core/deps/picotcp/modules/pico_socket_udp.c
+        core/deps/picotcp/modules/pico_strings.c
+        core/deps/picotcp/modules/pico_tcp.c
+        core/deps/picotcp/modules/pico_udp.c
+        core/deps/picotcp/stack/pico_device.c
+        core/deps/picotcp/stack/pico_frame.c
+        core/deps/picotcp/stack/pico_md5.c
+        core/deps/picotcp/stack/pico_protocol.c
+        core/deps/picotcp/stack/pico_socket.c
+        core/deps/picotcp/stack/pico_socket_multicast.c
+        core/deps/picotcp/stack/pico_stack.c
+        core/deps/picotcp/stack/pico_tree.c)
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE _7ZIP_ST)
 target_sources(${PROJECT_NAME} PRIVATE core/deps/lzma/7zArcIn.c core/deps/lzma/7zBuf.c core/deps/lzma/7zCrc.c core/deps/lzma/7zCrcOpt.c core/deps/lzma/7zDec.c core/deps/lzma/7zFile.c core/deps/lzma/7zStream.c core/deps/lzma/Alloc.c core/deps/lzma/Bcj2.c core/deps/lzma/Bra86.c core/deps/lzma/Bra.c core/deps/lzma/BraIA64.c core/deps/lzma/CpuArch.c core/deps/lzma/Delta.c core/deps/lzma/LzFind.c core/deps/lzma/Lzma2Dec.c core/deps/lzma/Lzma86Dec.c core/deps/lzma/Lzma86Enc.c core/deps/lzma/LzmaDec.c core/deps/lzma/LzmaEnc.c core/deps/lzma/LzmaLib.c core/deps/lzma/Sort.c)
@@ -647,8 +675,9 @@ target_sources(${PROJECT_NAME} PRIVATE
         core/hw/naomi/naomi_roms.cpp
         core/hw/naomi/naomi_roms.h
         core/hw/naomi/naomi_roms_input.h
-        core/hw/pvr/drkPvr.cpp
         core/hw/pvr/helper_classes.h
+        core/hw/pvr/pvr.cpp
+        core/hw/pvr/pvr.h
         core/hw/pvr/pvr_mem.cpp
         core/hw/pvr/pvr_mem.h
         core/hw/pvr/pvr_regs.cpp
@@ -885,6 +914,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         core/emulator.h
         core/nullDC.cpp
         core/serialize.cpp
+        core/serialize.h
         core/stdclass.cpp
         core/stdclass.h
         core/types.h
@@ -912,7 +942,10 @@ if(NOT LIBRETRO)
 	target_sources(${PROJECT_NAME} PRIVATE
 	        core/rend/gles/imgui_impl_opengl3.cpp
 	        core/rend/gles/imgui_impl_opengl3.h
+	        core/rend/gles/opengl_driver.cpp
+	        core/rend/gles/opengl_driver.h
 	        core/rend/game_scanner.h
+	        core/rend/imgui_driver.h
 	        core/rend/gui.cpp
 	        core/rend/gui.h
 	        core/rend/gui_android.cpp
@@ -933,7 +966,7 @@ if(NOT (APPLE OR ANDROID OR USE_GLES OR USE_GLES2))
     	core/rend/gl4/gles.cpp)
 endif()
 
-if(USE_VULKAN AND NOT APPLE)
+if(USE_VULKAN)
 	if(NOT LIBRETRO)
 	    if(ANDROID)
 	        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_ANDROID_KHR)
@@ -941,6 +974,8 @@ if(USE_VULKAN AND NOT APPLE)
 	        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_XLIB_KHR)
 	    elseif(WIN32)
 	        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_WIN32_KHR)
+		elseif(APPLE)
+	        set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_MACOS_MVK)
 	    endif()
 	
 	    set(VOLK_PULL_IN_VULKAN OFF)
@@ -992,36 +1027,33 @@ if(USE_VULKAN AND NOT APPLE)
 	            core/deps/libretro-common/vulkan/vulkan_symbol_wrapper.c)
 	else()
 	    target_sources(${PROJECT_NAME} PRIVATE
+	            core/rend/vulkan/vulkan_driver.h
 	            core/rend/vulkan/vulkan_context.cpp
 	            core/rend/vulkan/imgui_impl_vulkan.cpp
 	            core/rend/vulkan/imgui_impl_vulkan.h)
 	endif()
 endif()
 
+if(WIN32 AND NOT LIBRETRO AND NOT WINDOWS_STORE)
+	add_subdirectory(core/rend/dx9)
+	target_link_libraries(${PROJECT_NAME} PRIVATE dx9renderer)
+endif()
+
 if(WIN32 AND NOT LIBRETRO)
 	target_sources(${PROJECT_NAME} PRIVATE
-		core/rend/dx9/comptr.h
-		core/rend/dx9/d3d_overlay.h
-		core/rend/dx9/d3d_overlay.cpp
-		core/rend/dx9/d3d_renderer.h
-		core/rend/dx9/d3d_renderer.cpp
-		core/rend/dx9/d3d_shaders.h
-		core/rend/dx9/d3d_shaders.cpp
-		core/rend/dx9/d3d_texture.h
-		core/rend/dx9/d3d_texture.cpp
-		core/rend/dx9/dxcontext.h
-		core/rend/dx9/dxcontext.cpp
-		core/rend/dx9/imgui_impl_dx9.h
-		core/rend/dx9/imgui_impl_dx9.cpp)
-	if(NOT MINGW)
-		target_include_directories(${PROJECT_NAME} PRIVATE "$ENV{DXSDK_DIR}/Include")
-		if (CMAKE_SIZEOF_VOID_P EQUAL 8)
-			target_link_directories(${PROJECT_NAME} PRIVATE "$ENV{DXSDK_DIR}/Lib/x64")
-		else()
-			target_link_directories(${PROJECT_NAME} PRIVATE "$ENV{DXSDK_DIR}/Lib/x86")
-		endif()
-	endif()
-	target_link_libraries(${PROJECT_NAME} PRIVATE d3d9 d3dx9)
+		core/rend/dx11/dx11_driver.h
+		core/rend/dx11/dx11_renderer.cpp
+		core/rend/dx11/dx11_renderer.h
+		core/rend/dx11/dx11_shaders.cpp
+		core/rend/dx11/dx11_shaders.h
+		core/rend/dx11/dx11_texture.cpp
+		core/rend/dx11/dx11_texture.h
+		core/rend/dx11/dx11context.cpp
+		core/rend/dx11/dx11context.h
+		core/rend/dx11/imgui_impl_dx11.cpp
+		core/rend/dx11/imgui_impl_dx11.h
+		core/rend/dx11/dx11_driver.h)
+	target_link_libraries(${PROJECT_NAME} PRIVATE d3d11 d3dcompiler)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm.*|ARM.*)" AND NOT APPLE)
@@ -1179,7 +1211,6 @@ if(NOT LIBRETRO)
 		set_property(TARGET ${PROJECT_NAME} PROPERTY XCODE_ATTRIBUTE_SWIFT_VERSION "5.0")
 		if(IOS)
 			add_subdirectory(shell/apple/emulator-ios/AltKit)
-			target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/shell/apple/emulator-ios")
 			target_link_libraries(${PROJECT_NAME} PRIVATE AltKit)
 
 			target_sources(${PROJECT_NAME} PRIVATE
@@ -1264,13 +1295,9 @@ if(NOT LIBRETRO)
 				COMMAND rm -rf ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE}/Flycast.app ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE}/Flycast.swiftmodule)
 		else()
 			target_sources(${PROJECT_NAME} PRIVATE
-					shell/apple/emulator-osx/emulator-osx/AppDelegate.swift
-					shell/apple/emulator-osx/emulator-osx/EmuGLView.swift
-					shell/apple/emulator-osx/emulator-osx/osx-main.mm
-					shell/apple/emulator-osx/emulator-osx/osx_gamepad.h
-					shell/apple/emulator-osx/emulator-osx/osx_keyboard.h)
-		
-			set(XIB shell/apple/emulator-osx/emulator-osx/Base.lproj/MainMenu.xib)
+					shell/apple/emulator-osx/emulator-osx/SDLMain.h
+					shell/apple/emulator-osx/emulator-osx/SDLMain.mm
+					shell/apple/emulator-osx/emulator-osx/osx-main.mm)
 			set(ASSETS shell/apple/emulator-osx/emulator-osx/Images.xcassets)
 			target_sources(${PROJECT_NAME} PRIVATE ${XIB} ${ASSETS})
 			source_group("Resources" FILES ${XIB} ${ASSETS})
@@ -1290,8 +1317,6 @@ if(NOT LIBRETRO)
 				MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
 				MACOSX_BUNDLE_BUNDLE_VERSION "1"
 				MACOSX_BUNDLE_COPYRIGHT "Copyright © 2019 Flycast contributors. All rights reserved."
-				XCODE_ATTRIBUTE_SWIFT_OBJC_BRIDGING_HEADER "shell/apple/emulator-osx/emulator-osx/emulator-osx-Bridging-Header.h"
-				RESOURCE "${XIB}"
 				XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
 				BUILD_WITH_INSTALL_RPATH TRUE
 				INSTALL_RPATH "@loader_path/../Frameworks"
@@ -1301,8 +1326,21 @@ if(NOT LIBRETRO)
 			find_library(FOUNDATION_LIBRARY Foundation)
 			find_library(AUDIO_TOOLBOX_LIBRARY AudioToolbox)
 			find_library(MULTITOUCH_SUPPORT_LIBRARY MultitouchSupport /System/Library/PrivateFrameworks)
-		
-			target_link_libraries(${PROJECT_NAME} PRIVATE ${AUDIO_UNIT_LIBRARY} ${FOUNDATION_LIBRARY} ${AUDIO_TOOLBOX_LIBRARY} ${MULTITOUCH_SUPPORT_LIBRARY})
+			find_library(OPENGL_LIBRARY OpenGL)
+			find_library(IOSURFACE_LIBRARY IOSurface)
+
+			target_link_libraries(${PROJECT_NAME} PRIVATE
+				${AUDIO_UNIT_LIBRARY}
+				${FOUNDATION_LIBRARY}
+				${AUDIO_TOOLBOX_LIBRARY}
+				${MULTITOUCH_SUPPORT_LIBRARY}
+				${OPENGL_LIBRARY}
+				${IOSURFACE_LIBRARY})
+
+			set(output_dir $<$<CONFIG:Release>:${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE}>$<$<CONFIG:RelWithDebInfo>:${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO}>$<$<CONFIG:MinSizeRel>:${CMAKE_RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL}>$<$<CONFIG:Debug>:${CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG}>)
+			add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            	COMMAND ${CMAKE_COMMAND} -E copy "$ENV{VULKAN_SDK}/lib/libMoltenVK.dylib"
+            		${CMAKE_CURRENT_BINARY_DIR}/$<$<STREQUAL:$<GENEX_EVAL:${output_dir}>,>:$<CONFIG>>${output_dir}/Flycast.app/Contents/Frameworks/libvulkan.dylib)
 		endif()
 	elseif(UNIX OR NINTENDO_SWITCH)
 	    if(NOT BUILD_TESTING)
@@ -1318,9 +1356,27 @@ if(NOT LIBRETRO)
 	            core/windows/winmain.cpp
 	            core/windows/xinput_gamepad.h)
 	    endif()
-	    target_sources(${PROJECT_NAME} PRIVATE shell/windows/flycast.rc)
-
-	    target_link_libraries(${PROJECT_NAME} PRIVATE dsound opengl32 winmm ws2_32 wsock32 xinput9_1_0)
+		if(WINDOWS_STORE)
+			file(READ shell/uwp/Package.appxmanifest MANIFEST)
+			string(REPLACE "9.9.9.9" ${MS_VERSION} MANIFEST ${MANIFEST})
+			file(WRITE ${CMAKE_BINARY_DIR}/Package.appxmanifest ${MANIFEST})
+			set(ResourceFiles ${CMAKE_BINARY_DIR}/Package.appxmanifest
+					shell/uwp/flycast150.png
+					shell/uwp/flycast50.png
+					shell/uwp/flycast44.png
+					shell/uwp/splash.png
+					shell/uwp/flycast44.targetsize-48_altform-unplated.png
+					shell/uwp/flycast44.targetsize-48_altform-lightunplated.png
+					core/deps/SDL/src/main/winrt/SDL2-WinRTResource_BlankCursor.cur
+					core/deps/SDL/src/main/winrt/SDL2-WinRTResources.rc)
+			target_sources(${PROJECT_NAME} PRIVATE
+				${ResourceFiles}
+				core/deps/SDL/src/main/winrt/SDL_winrt_main_NonXAML.cpp)
+			set_target_properties(${PROJECT_NAME} PROPERTIES RESOURCE "${ResourceFiles}")
+		else()
+			target_sources(${PROJECT_NAME} PRIVATE shell/windows/flycast.rc)
+			target_link_libraries(${PROJECT_NAME} PRIVATE dsound opengl32 winmm ws2_32 wsock32 xinput9_1_0)
+		endif()
 	endif()
 endif()
 

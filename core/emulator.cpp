@@ -40,6 +40,8 @@
 #include "rend/gui.h"
 #include "lua/lua.h"
 #include "network/naomi_network.h"
+#include "serialize.h"
+#include "hw/pvr/pvr.h"
 #include <chrono>
 
 settings_t settings;
@@ -327,7 +329,7 @@ void dc_reset(bool hard)
 	if (hard)
 		_vmem_unprotect_vram(0, VRAM_SIZE);
 	sh4_sched_reset(hard);
-	libPvr_Reset(hard);
+	pvr::reset(hard);
 	libAICA_Reset(hard);
 	libARM_Reset(hard);
 	sh4_cpu.Reset(true);
@@ -382,7 +384,7 @@ void Emulator::init()
 	// Default platform
 	setPlatform(DC_PLATFORM_DREAMCAST);
 
-	libPvr_Init();
+	pvr::init();
 	libAICA_Init();
 	libARM_Init();
 	mem_Init();
@@ -444,7 +446,7 @@ void Emulator::loadGame(const char *path, LoadProgress *progress)
 
 		if (settings.platform.system == DC_PLATFORM_DREAMCAST)
 		{
-			if (path == NULL)
+			if (settings.content.path.empty())
 			{
 				// Boot BIOS
 				if (!LoadRomFiles())
@@ -545,7 +547,6 @@ void Emulator::unloadGame()
 	{
 		if (state == Loaded && config::AutoSaveState && !settings.content.path.empty())
 			dc_savestate(config::SavestateSlot);
-		EventManager::event(Event::Terminate);
 		dc_reset(true);
 
 		config::Settings::instance().reset();
@@ -553,6 +554,7 @@ void Emulator::unloadGame()
 		settings.content.path.clear();
 		settings.content.gameId.clear();
 		state = Init;
+		EventManager::event(Event::Terminate);
 	}
 }
 
@@ -567,7 +569,7 @@ void Emulator::term()
 		reios_term();
 		libARM_Term();
 		libAICA_Term();
-		libPvr_Term();
+		pvr::term();
 		mem_Term();
 
 		_vmem_release();
@@ -646,7 +648,7 @@ void Emulator::step()
 	stop();
 }
 
-bool dc_loadstate(const void **data, u32 size)
+void dc_loadstate(Deserializer& deser)
 {
 	custom_texture.Terminate();
 #if FEAT_AREC == DYNAREC_JIT
@@ -657,17 +659,10 @@ bool dc_loadstate(const void **data, u32 size)
 	bm_Reset();
 #endif
 
-	u32 usedSize = 0;
-	if (!dc_unserialize((void **)data, &usedSize))
-    	return false;
-
-	if (size != usedSize)
-		WARN_LOG(SAVESTATE, "Savestate: loaded %d bytes but used %d", size, usedSize);
+	dc_deserialize(deser);
 
 	mmu_set_state();
 	sh4_cpu.ResetCache();
-
-	return true;
 }
 
 void Emulator::setNetworkState(bool online)
@@ -680,22 +675,22 @@ void Emulator::setNetworkState(bool online)
 
 EventManager EventManager::Instance;
 
-void EventManager::registerEvent(Event event, Callback callback)
+void EventManager::registerEvent(Event event, Callback callback, void *param)
 {
-	unregisterEvent(event, callback);
+	unregisterEvent(event, callback, param);
 	auto it = callbacks.find(event);
 	if (it != callbacks.end())
-		it->second.push_back(callback);
+		it->second.push_back(std::make_pair(callback, param));
 	else
-		callbacks.insert({ event, { callback } });
+		callbacks.insert({ event, { std::make_pair(callback, param) } });
 }
 
-void EventManager::unregisterEvent(Event event, Callback callback) {
+void EventManager::unregisterEvent(Event event, Callback callback, void *param) {
 	auto it = callbacks.find(event);
 	if (it == callbacks.end())
 		return;
 
-	auto it2 = std::find(it->second.begin(), it->second.end(), callback);
+	auto it2 = std::find(it->second.begin(), it->second.end(), std::make_pair(callback, param));
 	if (it2 == it->second.end())
 		return;
 
@@ -707,8 +702,8 @@ void EventManager::broadcastEvent(Event event) {
 	if (it == callbacks.end())
 		return;
 
-	for (auto& callback : it->second)
-		callback(event);
+	for (auto& pair : it->second)
+		pair.first(event, pair.second);
 }
 
 void Emulator::run()
@@ -821,4 +816,5 @@ void Emulator::vblank()
 	else if (!config::ThreadedRendering)
 		sh4_cpu.Stop();
 }
+
 Emulator emu;

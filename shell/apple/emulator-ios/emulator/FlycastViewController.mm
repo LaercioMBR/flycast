@@ -40,7 +40,7 @@
 #include "ios_mouse.h"
 
 //@import AltKit;
-#import "AltKit/AltKit-Swift.h"
+#import "AltKit-Swift.h"
 
 std::string iosJitStatus;
 static bool iosJitAuthorized;
@@ -53,7 +53,7 @@ std::map<GCMouse *, std::shared_ptr<IOSMouse>> IOSMouse::mice;
 void common_linux_setup();
 
 static bool lockedPointer;
-static void updatePointerLock(Event event)
+static void updatePointerLock(Event event, void *)
 {
     if (@available(iOS 14.0, *)) {
         bool hasChanged = NO;
@@ -235,9 +235,8 @@ extern int screen_dpi;
 	  scale = [[UIScreen mainScreen] scale];
 	}
 	screen_dpi = roundf(160 * scale);
-	InitRenderApi();
+	initRenderApi();
 	mainui_init();
-	mainui_enabled = true;
 
 	[self altKitStart];
 }

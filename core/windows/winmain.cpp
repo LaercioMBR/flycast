@@ -17,6 +17,17 @@
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS 1
 #endif
+#include "build.h"
+#ifdef TARGET_UWP
+#include <winrt/Windows.Globalization.h>
+#include <winrt/Windows.Globalization.DateTimeFormatting.h>
+#include <winrt/Windows.Storage.h>
+#include <io.h>
+#include <fcntl.h>
+#include <nowide/config.hpp>
+#include <nowide/convert.hpp>
+#include <nowide/stackstring.hpp>
+#endif
 #include "oslib/oslib.h"
 #include "oslib/audiostream.h"
 #include "imgread/common.h"
@@ -35,6 +46,7 @@
 #include "rend/mainui.h"
 #include "../shell/windows/resource.h"
 #include "rawinput.h"
+#include "oslib/directory.h"
 #ifdef USE_BREAKPAD
 #include "breakpad/client/windows/handler/exception_handler.h"
 #include "version.h"
@@ -147,7 +159,7 @@ static bool gameRunning;
 
 static void captureMouse(bool);
 
-static void emuEventCallback(Event event)
+static void emuEventCallback(Event event, void *)
 {
 	static bool captureOn;
 	switch (event)
@@ -199,13 +211,16 @@ void os_SetupInput()
 	EventManager::listen(Event::Resume, emuEventCallback);
 	checkRawInput();
 #endif
+#ifndef TARGET_UWP
 	if (config::UseRawInput)
 		rawinput::init();
+#endif
 }
 
 
 static void setupPath()
 {
+#ifndef TARGET_UWP
 	wchar_t fname[512];
 	GetModuleFileNameW(0, fname, ARRAY_SIZE(fname));
 
@@ -225,7 +240,21 @@ static void setupPath()
 
 	std::string data_path = fn + "data\\";
 	set_user_data_dir(data_path);
-	CreateDirectory(data_path.c_str(), NULL);
+	flycast::mkdir(data_path.c_str(), 0755);
+#else
+	using namespace Windows::Storage;
+	StorageFolder^ localFolder = Windows::Storage::ApplicationData::Current->LocalFolder;
+	nowide::stackstring path;
+	path.convert(localFolder->Path->Data());
+	std::string homePath(path.c_str());
+	homePath += '\\';
+	set_user_config_dir(homePath);
+	homePath += "data\\";
+	set_user_data_dir(homePath);
+	flycast::mkdir(homePath.c_str(), 0755);
+	SetEnvironmentVariable(L"HOMEPATH", localFolder->Path->Data());
+	SetEnvironmentVariable(L"HOMEDRIVE", nullptr);
+#endif
 }
 
 void UpdateInputState()
@@ -316,10 +345,7 @@ static LRESULT CALLBACK WndProc2(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 		settings.display.width = LOWORD(lParam);
 		settings.display.height = HIWORD(lParam);
 		window_maximized = (wParam & SIZE_MAXIMIZED) != 0;
-#ifdef USE_VULKAN
-		theVulkanContext.SetResized();
-#endif
-		theDXContext.resize();
+		GraphicsContext::Instance()->resize();
 		return 0;
 
 	case WM_LBUTTONDOWN:
@@ -368,11 +394,11 @@ static LRESULT CALLBACK WndProc2(HWND hWnd, UINT message, WPARAM wParam, LPARAM 
 			mouse->setAbsPos(xPos, yPos, settings.display.width, settings.display.height);
 
 			if (wParam & MK_LBUTTON)
-				mouse->setButton(Button::LEFT_BUTTON, true);
+				mouse->setButton(Mouse::LEFT_BUTTON, true);
 			if (wParam & MK_MBUTTON)
-				mouse->setButton(Button::MIDDLE_BUTTON, true);
+				mouse->setButton(Mouse::MIDDLE_BUTTON, true);
 			if (wParam & MK_RBUTTON)
-				mouse->setButton(Button::RIGHT_BUTTON, true);
+				mouse->setButton(Mouse::RIGHT_BUTTON, true);
 		}
 		if (message != WM_MOUSEMOVE)
 			return 0;
@@ -471,12 +497,8 @@ void CreateMainWindow()
 
 	hWnd = CreateWindow(WINDOW_CLASS, VER_EMUNAME, WS_VISIBLE | WS_OVERLAPPEDWINDOW | (window_maximized ? WS_MAXIMIZE : 0),
 			window_x, window_y, sRect.right - sRect.left, sRect.bottom - sRect.top, NULL, NULL, hInstance, NULL);
-#ifdef USE_VULKAN
-	theVulkanContext.SetWindow((void *)hWnd, (void *)GetDC((HWND)hWnd));
-#endif
-	theGLContext.SetWindow(hWnd);
-	theGLContext.SetDeviceContext(GetDC(hWnd));
-	theDXContext.setNativeWindow(hWnd);
+	if (GraphicsContext::Instance() != nullptr)
+		GraphicsContext::Instance()->setWindow((void *)hWnd, (void *)GetDC((HWND)hWnd));
 }
 #endif
 
@@ -486,7 +508,7 @@ void os_CreateWindow()
 	sdl_window_create();
 #else
 	CreateMainWindow();
-	InitRenderApi();
+	initRenderApi((void *)hWnd, (void *)GetDC((HWND)hWnd));
 #endif	// !USE_SDL
 }
 
@@ -655,6 +677,7 @@ static void reserveBottomMemory()
 }
 static void findKeyboardLayout()
 {
+#ifndef TARGET_UWP
 	HKL keyboardLayout = GetKeyboardLayout(0);
 	WORD lcid = HIWORD(keyboardLayout);
 	switch (PRIMARYLANGID(lcid)) {
@@ -682,6 +705,7 @@ static void findKeyboardLayout()
 	default:
 		break;
 	}
+#endif
 }
 
 #if defined(USE_BREAKPAD)
@@ -702,12 +726,103 @@ static bool dumpCallback(const wchar_t* dump_path,
 }
 #endif
 
-// DEF_CONSOLE allows you to override linker subsystem and therefore default console //
-//	: pragma isn't pretty but def's are configurable 
-#ifdef DEF_CONSOLE
+#ifdef TARGET_UWP
+
+void gui_load_game()
+{
+	using namespace Windows::Storage;
+	using namespace Concurrency;
+
+	auto picker = ref new Pickers::FileOpenPicker();
+	picker->ViewMode = Pickers::PickerViewMode::List;
+
+	picker->FileTypeFilter->Append(".chd");
+	picker->FileTypeFilter->Append(".gdi");
+	picker->FileTypeFilter->Append(".cue");
+	picker->FileTypeFilter->Append(".cdi");
+	picker->FileTypeFilter->Append(".zip");
+	picker->FileTypeFilter->Append(".7z");
+	picker->FileTypeFilter->Append(".elf");
+	if (!config::HideLegacyNaomiRoms)
+	{
+		picker->FileTypeFilter->Append(".bin");
+		picker->FileTypeFilter->Append(".lst");
+		picker->FileTypeFilter->Append(".dat");
+	}
+	picker->SuggestedStartLocation = Pickers::PickerLocationId::DocumentsLibrary;
+
+	create_task(picker->PickSingleFileAsync()).then([](StorageFile ^file) {
+		if (file)
+		{
+			NOTICE_LOG(COMMON, "Picked file: %S", file->Path->Data());
+			nowide::stackstring path;
+			if (path.convert(file->Path->Data()))
+				gui_start_game(path.c_str());
+		}
+	});
+}
+
+namespace nowide {
+
+FILE *fopen(char const *file_name, char const *mode)
+{
+	wstackstring wname;
+	if (!wname.convert(file_name))
+	{
+		errno = EINVAL;
+		return nullptr;
+	}
+	DWORD dwDesiredAccess;
+	DWORD dwCreationDisposition;
+	int openFlags = 0;
+	if (strchr(mode, '+') != nullptr)
+		dwDesiredAccess = GENERIC_READ | GENERIC_WRITE;
+	else if (strchr(mode, 'r') != nullptr)
+	{
+		openFlags |= _O_RDONLY;
+		dwDesiredAccess = GENERIC_READ;
+	}
+	else
+		dwDesiredAccess = GENERIC_WRITE;
+	if (strchr(mode, 'w') != nullptr)
+		dwCreationDisposition = CREATE_ALWAYS;
+	else if (strchr(mode, 'a') != nullptr)
+	{
+		dwCreationDisposition = OPEN_ALWAYS;
+		openFlags |= _O_APPEND;
+	}
+	else
+		dwCreationDisposition = OPEN_EXISTING;
+	if (strchr(mode, 'b') == nullptr)
+		openFlags |= _O_TEXT;
+
+	HANDLE fileh = CreateFile2FromAppW(wname.c_str(), dwDesiredAccess, FILE_SHARE_READ, dwCreationDisposition, nullptr);
+	if (fileh == INVALID_HANDLE_VALUE)
+		return nullptr;
+
+	int fd = _open_osfhandle((intptr_t)fileh, openFlags);
+	if (fd == -1)
+	{
+		WARN_LOG(COMMON, "_open_osfhandle failed");
+		CloseHandle(fileh);
+		return nullptr;
+	}
+
+	return _fdopen(fd, mode);
+}
+
+}
+
+extern "C" int SDL_main(int argc, char* argv[])
+{
+
+
+#elif defined(DEF_CONSOLE)
+// DEF_CONSOLE allows you to override linker subsystem and therefore default console
+//	: pragma isn't pretty but def's are configurable
 #pragma comment(linker, "/subsystem:console")
 
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
 
 #else
@@ -731,19 +846,19 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	google_breakpad::CustomClientInfo custom_info = { custom_entries, ARRAY_SIZE(custom_entries) };
 
 	google_breakpad::ExceptionHandler handler(tempDir,
-			nullptr,
-			dumpCallback,
-			nullptr,
-			google_breakpad::ExceptionHandler::HANDLER_ALL,
-			MiniDumpNormal,
-			INVALID_HANDLE_VALUE,
-			&custom_info);
+		nullptr,
+		dumpCallback,
+		nullptr,
+		google_breakpad::ExceptionHandler::HANDLER_ALL,
+		MiniDumpNormal,
+		INVALID_HANDLE_VALUE,
+		&custom_info);
 	// crash on die() and failing verify()
 	handler.set_handle_debug_exceptions(true);
 #endif
 
 #if defined(_WIN32) && defined(LOG_TO_PTY)
-    setbuf(stderr,NULL);
+	setbuf(stderr, NULL);
 #endif
 	LogManager::Init();
 
@@ -754,6 +869,10 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	if (flycast_init(argc, argv) != 0)
 		die("Flycast initialization failed");
 
+#ifdef TARGET_UWP
+	if (config::ContentPath.get().empty())
+		config::ContentPath.get().push_back(get_writable_config_path(""));
+#endif
 	os_InstallFaultHandler();
 
 	mainui_loop();
@@ -765,7 +884,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 #ifdef USE_SDL
 	sdl_window_destroy();
 #else
-	TermRenderApi();
+	termRenderApi();
 	destroyMainWindow();
 	cfgSaveBool("window", "maximized", window_maximized);
 	if (!window_maximized && settings.display.width != 0 && settings.display.height != 0)
@@ -785,6 +904,7 @@ void os_DebugBreak()
 
 void os_DoEvents()
 {
+#ifndef TARGET_UWP
 	MSG msg;
 	while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
 	{
@@ -798,4 +918,5 @@ void os_DoEvents()
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
+#endif
 }

@@ -23,6 +23,12 @@ jobs:
       - name: Set up build environment (macos-latest)
         run: |
           brew install ccache libao libomp pulseaudio zlib ldid
+          curl https://sdk.lunarg.com/sdk/download/1.2.189.0/mac/vulkansdk-macos-1.2.189.0.dmg --output vulkansdk-macos-1.2.189.0.dmg
+          hdiutil attach ./vulkansdk-macos-1.2.189.0.dmg
+          pushd /Volumes/vulkansdk-macos-1.2.189.0
+          sudo ./InstallVulkan.app/Contents/MacOS/InstallVulkan --root ~/VulkanSDK/1.2.189.0 --accept-licenses --default-answer --confirm-command install
+          popd
+          echo "VULKAN_SDK=$HOME/VulkanSDK/1.2.189.0/macOS" >> $GITHUB_ENV
           echo "/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
           echo "CCACHE_DIR=/tmp/ccache" >> $GITHUB_ENV
         if: matrix.config.os == 'macos-latest'
@@ -69,7 +75,7 @@ jobs:
         with:
           msystem: MINGW64
           install: git base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-breakpad-git mingw-w64-x86_64-lua
-        if: matrix.config.os == 'windows-latest'
+        if: endsWith(matrix.config.name, 'w64-mingw32')
 
       - uses: actions/checkout@v2
         with:
@@ -90,7 +96,7 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config.buildType }} -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=artifact -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=artifact ${{ matrix.config.cmakeArgs }}
           cmake --build build --config Release --parallel 2
-        if: matrix.config.os != 'windows-latest'
+        if: endsWith(matrix.config.name, 'w64-mingw32') != true
 
       - name: CMake (windows)
         shell: msys2 {0}
@@ -98,7 +104,7 @@ jobs:
           unset temp tmp
           cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.config.buildType }} -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=artifact -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO=artifact -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=artifact ${{ matrix.config.cmakeArgs }}
           cmake --build build --config Release --parallel 2
-        if: matrix.config.os == 'windows-latest'
+        if: endsWith(matrix.config.name, 'w64-mingw32')
 
       - name: Unit Tests
         run: |

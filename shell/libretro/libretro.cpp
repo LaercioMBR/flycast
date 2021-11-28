@@ -563,7 +563,6 @@ static void update_variables(bool first_startup)
 			config::RendererType = RenderType::OpenGL;
 		config::PerStripSorting = false;
 	}
-	config::RendererType.commit();
 	if (!first_startup && previous_renderer != config::RendererType) {
 		rend_term_renderer();
 		rend_init_renderer();
@@ -838,7 +837,7 @@ void retro_run()
 	if (devices_need_refresh)
 		refresh_devices(false);
 
-	if (config::RendererType.isOpenGL())
+	if (isOpenGL(config::RendererType))
 		glsm_ctl(GLSM_CTL_STATE_BIND, nullptr);
 
 	// On the first call, we start the emulator
@@ -873,7 +872,7 @@ void retro_run()
 		environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
 	}
 
-	if (config::RendererType.isOpenGL())
+	if (isOpenGL(config::RendererType))
 		glsm_ctl(GLSM_CTL_STATE_UNBIND, nullptr);
 
 	video_cb(is_dupe ? 0 : RETRO_HW_FRAME_BUFFER_VALID, framebufferWidth, framebufferHeight, 0);
@@ -924,7 +923,7 @@ static void context_reset()
 	glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
 	glsm_ctl(GLSM_CTL_STATE_SETUP, NULL);
 	rend_term_renderer();
-	theGLContext.Init();
+	theGLContext.init();
 	rend_init_renderer();
 	rend_resize_renderer();
 }
@@ -1378,7 +1377,7 @@ static void retro_vk_context_reset()
 		ERROR_LOG(RENDERER, "Get Vulkan HW interface failed");
 		return;
 	}
-	theVulkanContext.Init((retro_hw_render_interface_vulkan *)vulkan);
+	theVulkanContext.init((retro_hw_render_interface_vulkan *)vulkan);
 	rend_term_renderer();
 	rend_init_renderer();
 	rend_resize_renderer();
@@ -1387,7 +1386,7 @@ static void retro_vk_context_reset()
 static void retro_vk_context_destroy()
 {
 	rend_term_renderer();
-	theVulkanContext.Term();
+	theVulkanContext.term();
 }
 
 static bool set_vulkan_hw_render()
@@ -1416,7 +1415,6 @@ static bool set_vulkan_hw_render()
 		config::RendererType = RenderType::Vulkan;
 	else if (config::RendererType == RenderType::OpenGL_OIT)
 		config::RendererType = RenderType::Vulkan_OIT;
-	config::RendererType.commit();
 	return true;
 }
 #else
@@ -1471,7 +1469,6 @@ static bool set_opengl_hw_render(u32 preferred)
 		params.major                 = 3;
 		params.minor                 = preferred == RETRO_HW_CONTEXT_OPENGL_CORE ? 2 : 0;
 		config::RendererType = RenderType::OpenGL;
-		config::RendererType.commit();
 	}
 
 	if (glsm_ctl(GLSM_CTL_STATE_CONTEXT_INIT, &params))
@@ -1487,7 +1484,6 @@ static bool set_opengl_hw_render(u32 preferred)
 	params.minor              = 0;
 #endif
 	config::RendererType = RenderType::OpenGL;
-	config::RendererType.commit();
 	return glsm_ctl(GLSM_CTL_STATE_CONTEXT_INIT, &params);
 #else
 	return false;
@@ -1743,14 +1739,11 @@ size_t retro_serialize_size()
 
 	emu.stop();
 
-	unsigned int total_size = 0;
-	void *data = nullptr;
-
-	dc_serialize(&data, &total_size);
-
+	Serializer ser;
+	dc_serialize(ser);
 	emu.start();
 
-	return total_size;
+	return ser.size();
 }
 
 bool retro_serialize(void *data, size_t size)
@@ -1760,12 +1753,11 @@ bool retro_serialize(void *data, size_t size)
 
 	emu.stop();
 
-	unsigned int total_size = 0;
-	bool result = dc_serialize(&data, &total_size);
-
+	Serializer ser(data, size);
+	dc_serialize(ser);
 	emu.start();
 
-	return result;
+	return true;
 }
 
 bool retro_unserialize(const void * data, size_t size)
@@ -1775,11 +1767,16 @@ bool retro_unserialize(const void * data, size_t size)
 
 	emu.stop();
 
-    bool result = dc_loadstate(&data, size);
+	try {
+		Deserializer deser(data, size);
+		dc_loadstate(deser);
+		emu.start();
 
-	emu.start();
-
-    return result;
+		return true;
+	} catch (const Deserializer::Exception& e) {
+		ERROR_LOG(SAVESTATE, "Loading state failed: %s", e.what());
+		return false;
+	}
 }
 
 // Cheats
