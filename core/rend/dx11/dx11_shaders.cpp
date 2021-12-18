@@ -17,8 +17,17 @@
     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
 */
 #include "dx11_shaders.h"
+#include "dx11context.h"
+#include "stdclass.h"
+#include <xxhash.h>
 
 const char * const VertexShader = R"(
+#if pp_Gouraud == 1
+#define INTERPOLATION
+#else
+#define INTERPOLATION nointerpolation
+#endif
+
 struct VertexIn
 {
 	float4 pos : POSITION;
@@ -31,15 +40,20 @@ struct VertexOut
 {
 	float4 pos : SV_POSITION;
 	float4 uv : TEXCOORD0;
-	float4 col : COLOR0;
-	float4 spec : COLOR1;
+	INTERPOLATION float4 col : COLOR0;
+	INTERPOLATION float4 spec : COLOR1;
 };
 
 cbuffer constantBuffer : register(b0)
 {
 	float4x4 transMatrix;
+	float4 leftPlane;
+	float4 topPlane;
+	float4 rightPlane;
+	float4 bottomPlane;
 };
 
+[clipplanes(leftPlane, topPlane, rightPlane, bottomPlane)]
 VertexOut main(in VertexIn vin)
 {
 	VertexOut vo;
@@ -62,7 +76,7 @@ VertexOut main(in VertexIn vin)
 
 )";
 
-const char * const ModVolVertexShader = R"(
+const char *ModVolVertexShader = R"(
 struct VertexIn
 {
 	float4 pos : POSITION;
@@ -77,6 +91,10 @@ struct VertexOut
 cbuffer constantBuffer : register(b0)
 {
 	float4x4 transMatrix;
+	float4 leftPlane;
+	float4 topPlane;
+	float4 rightPlane;
+	float4 bottomPlane;
 };
 
 VertexOut main(in VertexIn vin)
@@ -95,14 +113,20 @@ VertexOut main(in VertexIn vin)
 
 const char * const PixelShader = R"(
 
+#if pp_Gouraud == 1
+#define INTERPOLATION
+#else
+#define INTERPOLATION nointerpolation
+#endif
+
 #define PI 3.1415926f
 
 struct Pixel 
 {
 	float4 pos : SV_POSITION;
 	float4 uv : TEXCOORD0;
-	float4 col : COLOR0;
-	float4 spec : COLOR1;
+	INTERPOLATION float4 col : COLOR0;
+	INTERPOLATION float4 spec : COLOR1;
 };
 
 Texture2D texture0 : register(t0);
@@ -121,12 +145,13 @@ cbuffer constantBuffer : register(b0)
 	float4 FOG_COL_VERT;
 	float4 FOG_COL_RAM;
 	float fogDensity;
-	float fogScale;
+	float shadowScale;
 	float alphaTestValue;
 };
 
 cbuffer polyConstantBuffer : register(b1)
 {
+	float4 clipTest;
 	float paletteIndex;
 	float trilinearAlpha;
 };
@@ -154,7 +179,7 @@ float4 clampColor(float4 color)
 
 float4 palettePixel(float2 coords)
 {
-	int colorIdx = int(floor(texture0.Sample(sampler0, coords).a * 255.0f + 0.5f) + paletteIndex.x);
+	uint colorIdx = int(floor(texture0.Sample(sampler0, coords).a * 255.0f + 0.5f) + paletteIndex);
     float2 c = float2((fmod(float(colorIdx), 32.0f) * 2.0f + 1.0f) / 64.0f, (float(colorIdx / 32) * 2.0f + 1.0f) / 64.0f);
 	return paletteTexture.Sample(paletteSampler, c);
 }
@@ -168,7 +193,13 @@ struct PSO
 };
 
 PSO main(in Pixel inpix)
-{ 
+{
+#if pp_ClipInside == 1
+	// Clip inside the box
+	if (inpix.pos.x >= clipTest.x && inpix.pos.x <= clipTest.z
+			&& inpix.pos.y >= clipTest.y && inpix.pos.y <= clipTest.w)
+		discard;
+#endif
 #if pp_Gouraud == 1
 	float4 color = inpix.col / inpix.uv.w;
 	#if pp_BumpMap == 1 || pp_Offset == 1
@@ -189,6 +220,9 @@ PSO main(in Pixel inpix)
 	#if pp_Texture == 1
 	{
 		float2 uv = inpix.uv.xy / inpix.uv.w;
+		#if NearestWrapFix == 1
+			uv = min(fmod(uv, 1.f), 0.9997f);
+		#endif
 		#if pp_Palette == 0
 			float4 texcol = texture0.Sample(sampler0, uv);
 		#else
@@ -262,7 +296,7 @@ PSO modifierVolume(in MVPixel inpix)
 	PSO pso;
 	float w = inpix.uv.w * 100000.0f;
 	pso.z = log2(1.0f + w) / 34.0f;
-	pso.col = float4(0, 0, 0, fogScale);
+	pso.col = float4(0, 0, 0, 1.f - shadowScale);
 
 	return pso;
 }
@@ -287,7 +321,7 @@ VertexOut main(in VertexIn vin)
 #if ROTATE == 0
 	vo.pos = float4(vin.pos, 0.f, 1.f);
 #else
-	vo.pos = float4(vin.pos.y, -vin.pos.x, 0.f, 1.f);
+	vo.pos = float4(-vin.pos.y, vin.pos.x, 0.f, 1.f);
 #endif
 	vo.uv = vin.uv;
 
@@ -296,6 +330,11 @@ VertexOut main(in VertexIn vin)
 )";
 
 const char * const QuadPixelShader = R"(
+cbuffer constantBuffer : register(b0)
+{
+	float4 color;
+};
+
 struct VertexIn
 {
 	float4 pos : SV_POSITION;
@@ -307,7 +346,7 @@ Texture2D texture0;
 
 float4 main(in VertexIn vin) : SV_Target
 {
-	return texture0.Sample(sampler0, vin.uv);
+	return color * texture0.Sample(sampler0, vin.uv);
 }
 
 )";
@@ -332,7 +371,9 @@ enum PixelMacroEnum {
 	MacroFogClamping,
 	MacroTriLinear,
 	MacroPalette,
-	MacroAlphaTest
+	MacroAlphaTest,
+	MacroClipInside,
+	MacroNearestWrapFix
 };
 
 static D3D_SHADER_MACRO PixelMacros[]
@@ -349,12 +390,14 @@ static D3D_SHADER_MACRO PixelMacros[]
 	{ "pp_TriLinear", "0" },
 	{ "pp_Palette", "0" },
 	{ "cp_AlphaTest", "0" },
+	{ "pp_ClipInside", "0" },
+	{ "NearestWrapFix", "0" },
 	{ nullptr, nullptr }
 };
 
 const ComPtr<ID3D11PixelShader>& DX11Shaders::getShader(bool pp_Texture, bool pp_UseAlpha, bool pp_IgnoreTexA, u32 pp_ShadInstr,
 		bool pp_Offset, u32 pp_FogCtrl, bool pp_BumpMap, bool fog_clamping,
-		bool trilinear, bool palette, bool gouraud, bool alphaTest)
+		bool trilinear, bool palette, bool gouraud, bool alphaTest, bool clipInside, bool nearestWrapFix)
 {
 	const u32 hash = (int)pp_Texture
 			| (pp_UseAlpha << 1)
@@ -367,7 +410,9 @@ const ComPtr<ID3D11PixelShader>& DX11Shaders::getShader(bool pp_Texture, bool pp
 			| (trilinear << 10)
 			| (palette << 11)
 			| (gouraud << 12)
-			| (alphaTest << 13);
+			| (alphaTest << 13)
+			| (clipInside << 14)
+			| (nearestWrapFix << 15);
 	auto& shader = shaders[hash];
 	if (shader == nullptr)
 	{
@@ -385,6 +430,8 @@ const ComPtr<ID3D11PixelShader>& DX11Shaders::getShader(bool pp_Texture, bool pp
 		PixelMacros[MacroTriLinear].Definition = MacroValues[trilinear];
 		PixelMacros[MacroPalette].Definition = MacroValues[palette];
 		PixelMacros[MacroAlphaTest].Definition = MacroValues[alphaTest];
+		PixelMacros[MacroClipInside].Definition = MacroValues[clipInside];
+		PixelMacros[MacroNearestWrapFix].Definition = MacroValues[nearestWrapFix];
 
 		shader = compilePS(PixelShader, "main", PixelMacros);
 		verify(shader != nullptr);
@@ -446,10 +493,17 @@ const ComPtr<ID3D11PixelShader>& DX11Shaders::getQuadPixelShader()
 
 ComPtr<ID3DBlob> DX11Shaders::compileShader(const char* source, const char* function, const char* profile, const D3D_SHADER_MACRO *pDefines)
 {
+	u64 hash = hashShader(source, function, profile, pDefines);
+
 	ComPtr<ID3DBlob> shaderBlob;
-	ComPtr<ID3DBlob> errorBlob;
-	if (FAILED(D3DCompile(source, strlen(source), nullptr, pDefines, nullptr, function, profile, 0, 0, &shaderBlob.get(), &errorBlob.get())))
-		ERROR_LOG(RENDERER, "Shader compilation failed: %s", errorBlob->GetBufferPointer());
+	if (!lookupShader(hash, shaderBlob))
+	{
+		ComPtr<ID3DBlob> errorBlob;
+		if (FAILED(this->D3DCompile(source, strlen(source), nullptr, pDefines, nullptr, function, profile, 0, 0, &shaderBlob.get(), &errorBlob.get())))
+			ERROR_LOG(RENDERER, "Shader compilation failed: %s", errorBlob->GetBufferPointer());
+		else
+			cacheShader(hash, shaderBlob);
+	}
 
 	return shaderBlob;
 }
@@ -494,4 +548,125 @@ ComPtr<ID3DBlob> DX11Shaders::getMVVertexShaderBlob()
 ComPtr<ID3DBlob> DX11Shaders::getQuadVertexShaderBlob()
 {
 	return compileShader(QuadVertexShader, "main", "vs_4_0", nullptr);
+}
+
+void DX11Shaders::init(const ComPtr<ID3D11Device>& device, pD3DCompile D3DCompile)
+{
+	this->device = device;
+	this->D3DCompile = D3DCompile;
+	enableCache(!theDX11Context.hasShaderCache());
+	loadCache(CacheFile);
+}
+
+void DX11Shaders::term()
+{
+	saveCache(CacheFile);
+	shaders.clear();
+	gouraudVertexShader.reset();
+	flatVertexShader.reset();
+	modVolShader.reset();
+	modVolVertexShader.reset();
+	quadVertexShader.reset();
+	quadRotateVertexShader.reset();
+	quadPixelShader.reset();
+	device.reset();
+}
+
+void CachedDX11Shaders::saveCache(const std::string& filename)
+{
+	if (!enabled)
+		return;
+	std::string path = hostfs::getShaderCachePath(filename);
+	FILE *fp = nowide::fopen(path.c_str(), "wb");
+	if (fp == nullptr)
+	{
+		WARN_LOG(RENDERER, "Cannot save shader cache to %s", path.c_str());
+		return;
+	}
+	for (const auto& pair : shaderCache)
+	{
+		if (std::fwrite(&pair.first, sizeof(pair.first), 1, fp) != 1
+				|| std::fwrite(&pair.second.size, sizeof(pair.second.size), 1, fp) != 1
+				|| std::fwrite(&pair.second.blob[0], 1, pair.second.size, fp) != pair.second.size)
+		{
+			WARN_LOG(RENDERER, "Error saving shader cache to %s", path.c_str());
+			break;
+		}
+	}
+	NOTICE_LOG(RENDERER, "Saved %d shaders to %s", (int)shaderCache.size(), path.c_str());
+	std::fclose(fp);
+}
+
+void CachedDX11Shaders::loadCache(const std::string& filename)
+{
+	if (!enabled)
+		return;
+	std::string path = hostfs::getShaderCachePath(filename);
+	FILE *fp = nowide::fopen(path.c_str(), "rb");
+	if (fp != nullptr)
+	{
+		u64 hash;
+		u32 size;
+		while (true)
+		{
+			if (std::fread(&hash, sizeof(hash), 1, fp) != 1)
+				break;
+			if (std::fread(&size, sizeof(size), 1, fp) != 1)
+				break;
+			std::unique_ptr<u8[]> blob = std::unique_ptr<u8[]>(new u8[size]);
+			if (std::fread(&blob[0], 1, size, fp) != size)
+				break;
+			shaderCache[hash] = { size, std::move(blob) };
+		}
+		std::fclose(fp);
+		NOTICE_LOG(RENDERER, "Loaded %d shaders from %s", (int)shaderCache.size(), path.c_str());
+	}
+
+}
+bool CachedDX11Shaders::lookupShader(u64 hash, ComPtr<ID3DBlob>& blob)
+{
+	if (!enabled)
+		return false;
+
+	auto it = shaderCache.find(hash);
+	if (it == shaderCache.end())
+		return false;
+
+	D3DCreateBlob(it->second.size, &blob.get());
+	memcpy(blob->GetBufferPointer(), &it->second.blob[0], it->second.size);
+
+	return true;
+}
+
+void CachedDX11Shaders::cacheShader(u64 hash, const ComPtr<ID3DBlob>& blob)
+{
+	if (!enabled)
+		return;
+	u32 size = (u32)blob->GetBufferSize();
+	std::unique_ptr<u8[]> data = std::unique_ptr<u8[]>(new u8[size]);
+	memcpy(&data[0], blob->GetBufferPointer(), size);
+	shaderCache[hash] = { size, std::move(data) };
+}
+
+u64 CachedDX11Shaders::hashShader(const char* source, const char* function, const char* profile, const D3D_SHADER_MACRO *pDefines, const char *includeFile)
+{
+	if (!enabled)
+		return 0;
+
+	XXH64_state_t *xxh = XXH64_createState();
+	XXH64_reset(xxh, 777);
+	XXH64_update(xxh, source, strlen(source));
+	XXH64_update(xxh, function, strlen(function));
+	if (pDefines != nullptr)
+		for (const D3D_SHADER_MACRO *pDef = pDefines; pDef->Name != nullptr; pDef++)
+		{
+			XXH64_update(xxh, pDef->Name, strlen(pDef->Name));
+			XXH64_update(xxh, pDef->Definition, strlen(pDef->Definition));
+		}
+	if (includeFile != nullptr)
+		XXH64_update(xxh, includeFile, strlen(includeFile));
+	u64 hash = XXH64_digest(xxh);
+	XXH64_freeState(xxh);
+
+	return hash;
 }

@@ -17,7 +17,10 @@
     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
 */
 #pragma once
-#include "dx11context.h"
+#include "types.h"
+#include <d3d11.h>
+#include "windows/comptr.h"
+#include <array>
 #include <unordered_map>
 
 const D3D11_COMPARISON_FUNC Zfunction[]
@@ -41,7 +44,8 @@ const D3D11_BLEND DestBlend[]
 	D3D11_BLEND_SRC_ALPHA,
 	D3D11_BLEND_INV_SRC_ALPHA,
 	D3D11_BLEND_DEST_ALPHA,
-	D3D11_BLEND_INV_DEST_ALPHA
+	D3D11_BLEND_INV_DEST_ALPHA,
+	D3D11_BLEND_INV_BLEND_FACTOR
 };
 
 const D3D11_BLEND SrcBlend[]
@@ -53,7 +57,34 @@ const D3D11_BLEND SrcBlend[]
 	D3D11_BLEND_SRC_ALPHA,
 	D3D11_BLEND_INV_SRC_ALPHA,
 	D3D11_BLEND_DEST_ALPHA,
-	D3D11_BLEND_INV_DEST_ALPHA
+	D3D11_BLEND_INV_DEST_ALPHA,
+	D3D11_BLEND_BLEND_FACTOR
+};
+
+const D3D11_BLEND DestBlendAlpha[]
+{
+	D3D11_BLEND_ZERO,
+	D3D11_BLEND_ONE,
+	D3D11_BLEND_SRC_ALPHA,
+	D3D11_BLEND_INV_SRC_ALPHA,
+	D3D11_BLEND_SRC_ALPHA,
+	D3D11_BLEND_INV_SRC_ALPHA,
+	D3D11_BLEND_DEST_ALPHA,
+	D3D11_BLEND_INV_DEST_ALPHA,
+	D3D11_BLEND_INV_BLEND_FACTOR
+};
+
+const D3D11_BLEND SrcBlendAlpha[]
+{
+	D3D11_BLEND_ZERO,
+	D3D11_BLEND_ONE,
+	D3D11_BLEND_DEST_ALPHA,
+	D3D11_BLEND_INV_DEST_ALPHA,
+	D3D11_BLEND_SRC_ALPHA,
+	D3D11_BLEND_INV_SRC_ALPHA,
+	D3D11_BLEND_DEST_ALPHA,
+	D3D11_BLEND_INV_DEST_ALPHA,
+	D3D11_BLEND_BLEND_FACTOR
 };
 
 class DepthStencilStates
@@ -63,7 +94,7 @@ public:
 
 	ComPtr<ID3D11DepthStencilState> getState(bool depth, bool depthWrite, int depthFunc, bool stencil)
 	{
-		int hash = (depthFunc << 3) | depth | (depthWrite << 1) | (stencil << 2);
+		int hash = (depthFunc << 3) | (int)depth | ((int)depthWrite << 1) | ((int)stencil << 2);
 		auto& state = states[hash];
 		if (!state)
 		{
@@ -72,12 +103,12 @@ public:
 			desc.DepthWriteMask = depthWrite ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
 			desc.DepthFunc = Zfunction[depthFunc];
 			desc.StencilEnable = stencil;
-			desc.FrontFace.StencilFailOp = desc.FrontFace.StencilDepthFailOp = desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+			desc.FrontFace.StencilFailOp = desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+			desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
 			desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
 			desc.BackFace = desc.FrontFace;
 			desc.StencilWriteMask = 0xFF;
-			desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
-			theDX11Context.getDevice()->CreateDepthStencilState(&desc, &state.get());
+			createDepthStencilState(&desc, &state.get());
 		}
 		return state;
 	}
@@ -131,7 +162,7 @@ public:
 				break;
 			}
 			desc.BackFace = desc.FrontFace;
-			theDX11Context.getDevice()->CreateDepthStencilState(&desc, &state.get());
+			createDepthStencilState(&desc, &state.get());
 		}
 		return state;
 	}
@@ -144,6 +175,8 @@ public:
 	}
 
 private:
+	HRESULT createDepthStencilState(const D3D11_DEPTH_STENCIL_DESC *desc, ID3D11DepthStencilState **state);
+
 	std::unordered_map<int, ComPtr<ID3D11DepthStencilState>> states;
 	std::array<ComPtr<ID3D11DepthStencilState>, ModifierVolumeMode::Count> mvStates;
 };
@@ -153,7 +186,7 @@ class BlendStates
 public:
 	ComPtr<ID3D11BlendState> getState(bool enable, int srcBlend = 0, int destBlend = 0, bool disableWrite = false)
 	{
-		int hash = enable | (srcBlend << 1) | (destBlend << 4) | (disableWrite << 7);
+		int hash = (int)enable | (srcBlend << 1) | (destBlend << 5) | ((int)disableWrite << 9);
 		auto& state = states[hash];
 		if (!state)
 		{
@@ -163,10 +196,10 @@ public:
 			desc.RenderTarget[0].SrcBlend = SrcBlend[srcBlend];
 			desc.RenderTarget[0].DestBlend = DestBlend[destBlend];
 			desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-			desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
-			desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+			desc.RenderTarget[0].SrcBlendAlpha =  SrcBlendAlpha[srcBlend];
+			desc.RenderTarget[0].DestBlendAlpha = DestBlendAlpha[destBlend];
 			desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-			theDX11Context.getDevice()->CreateBlendState(&desc, &state.get());
+			createBlendState(&desc, &state.get());
 		}
 		return state;
 	}
@@ -176,5 +209,7 @@ public:
 	}
 
 private:
+	HRESULT createBlendState(const D3D11_BLEND_DESC *, ID3D11BlendState **state);
+
 	std::unordered_map<int, ComPtr<ID3D11BlendState>> states;
 };

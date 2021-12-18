@@ -17,6 +17,7 @@
     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
 */
 #include "dx11context.h"
+#ifndef LIBRETRO
 #include "rend/gui.h"
 #include "rend/osd.h"
 #ifdef USE_SDL
@@ -49,17 +50,24 @@ bool DX11Context::init(bool keepCurrentWindow)
 		{
 		case GAMING_DEVICE_DEVICE_ID_XBOX_ONE:
 		case GAMING_DEVICE_DEVICE_ID_XBOX_ONE_S:
-			NOTICE_LOG(RENDERER, "XBox One [S] detected. Setting resolution to 1920x1080.");
-			settings.display.width = 1920;
-			settings.display.height = 1080;
-			break;
-
 		case GAMING_DEVICE_DEVICE_ID_XBOX_ONE_X:
 		case GAMING_DEVICE_DEVICE_ID_XBOX_ONE_X_DEVKIT:
+			{
+				Windows::Graphics::Display::Core::HdmiDisplayInformation^ dispInfo = Windows::Graphics::Display::Core::HdmiDisplayInformation::GetForCurrentView();
+				Windows::Graphics::Display::Core::HdmiDisplayMode^ displayMode = dispInfo->GetCurrentDisplayMode();
+				NOTICE_LOG(RENDERER, "HDMI resolution: %d x %d", displayMode->ResolutionWidthInRawPixels, displayMode->ResolutionHeightInRawPixels);
+				settings.display.width = displayMode->ResolutionWidthInRawPixels;
+				settings.display.height = displayMode->ResolutionHeightInRawPixels;
+				if (settings.display.width == 3840)
+					// 4K
+					scaling = 2.8f;
+				else
+					scaling = 1.4f;
+			}
+			break;
+
 		default:
-			NOTICE_LOG(RENDERER, "XBox One X detected. Setting resolution to 3840x2160.");
-			settings.display.width = 3840;
-			settings.display.height = 2160;
+			scaling = 1.f;
 		    break;
 		}
 	}
@@ -76,12 +84,12 @@ bool DX11Context::init(bool keepCurrentWindow)
 	    nullptr, // Specify nullptr to use the default adapter.
 	    D3D_DRIVER_TYPE_HARDWARE,
 	    nullptr,
-		D3D11_CREATE_DEVICE_BGRA_SUPPORT, // | D3D11_CREATE_DEVICE_DEBUG, // FIXME
+		D3D11_CREATE_DEVICE_BGRA_SUPPORT, // | D3D11_CREATE_DEVICE_DEBUG,
 	    featureLevels,
 	    ARRAYSIZE(featureLevels),
-	    D3D11_SDK_VERSION, // UWP apps must set this to D3D11_SDK_VERSION.
+	    D3D11_SDK_VERSION,
 	    &pDevice.get(),
-	    nullptr,
+	    &featureLevel,
 	    &pDeviceContext.get());
 
 	ComPtr<IDXGIDevice2> dxgiDevice;
@@ -95,6 +103,7 @@ bool DX11Context::init(bool keepCurrentWindow)
 	wdesc.convert(desc.Description);
 	adapterDesc = wdesc.c_str();
 	adapterVersion = std::to_string(desc.Revision);
+	vendorId = desc.VendorId;
 
 	ComPtr<IDXGIFactory1> dxgiFactory;
 	dxgiAdapter->GetParent(__uuidof(IDXGIFactory1), (void **)&dxgiFactory.get());
@@ -149,10 +158,23 @@ bool DX11Context::init(bool keepCurrentWindow)
 	if (FAILED(hr))
 		return false;
 
+#ifndef TARGET_UWP
+	// Prevent DXGI from monitoring our message queue for ALT+Enter
+	dxgiFactory->MakeWindowAssociation((HWND)window, DXGI_MWA_NO_WINDOW_CHANGES);
+#endif
+	D3D11_FEATURE_DATA_SHADER_CACHE cacheSupport{};
+	if (SUCCEEDED(pDevice->CheckFeatureSupport(D3D11_FEATURE_SHADER_CACHE, &cacheSupport, (UINT)sizeof(cacheSupport))))
+	{
+		_hasShaderCache = cacheSupport.SupportFlags & D3D11_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE;
+		if (!_hasShaderCache)
+			NOTICE_LOG(RENDERER, "No system-provided shader cache");
+	}
+
 	imguiDriver = std::unique_ptr<ImGuiDriver>(new DX11Driver());
 	resize();
 	gui_init();
-// TODO overlay.init(pDevice);
+	shaders.init(pDevice, &D3DCompile);
+	overlay.init(pDevice, pDeviceContext, &shaders, &samplers);
 	return ImGui_ImplDX11_Init(pDevice, pDeviceContext);
 }
 
@@ -160,15 +182,20 @@ void DX11Context::term()
 {
 	NOTICE_LOG(RENDERER, "DX11 Context terminating");
 	GraphicsContext::instance = nullptr;
-	ID3D11RenderTargetView* views[1] {};
-	pDeviceContext->OMSetRenderTargets(ARRAY_SIZE(views), views, nullptr);
-//TODO	overlay.term();
+	overlay.term();
+	samplers.term();
+	shaders.term();
 	imguiDriver.reset();
 	ImGui_ImplDX11_Shutdown();
 	gui_term();
 	renderTargetView.reset();
 	swapchain1.reset();
 	swapchain.reset();
+	if (pDeviceContext)
+	{
+		pDeviceContext->ClearState();
+		pDeviceContext->Flush();
+	}
 	pDeviceContext.reset();
 	pDevice.reset();
 }
@@ -179,13 +206,22 @@ void DX11Context::Present()
 		return;
 	frameRendered = false;
 	bool swapOnVSync = !settings.input.fastForwardMode && config::VSync;
-	HRESULT hr = swapchain->Present(swapOnVSync ? 1 : 0, 0);
+	HRESULT hr;
+	if (swapOnVSync)
+	{
+		int swapInterval = std::min(4, std::max(1, (int)(settings.display.refreshRate / 60)));
+		hr = swapchain->Present(swapInterval, 0);
+	}
+	else
+	{
+		hr = swapchain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+	}
 	if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
 	{
 		WARN_LOG(RENDERER, "Present failed: device removed/reset");
 		handleDeviceLost();
 	}
-	else if (FAILED(hr))
+	else if (hr != DXGI_ERROR_WAS_STILL_DRAWING && FAILED(hr))
 		WARN_LOG(RENDERER, "Present failed %x", hr);
 }
 
@@ -200,15 +236,15 @@ void DX11Context::EndImGuiFrame()
 		if (renderer != nullptr)
 			renderer->RenderLastFrame();
 	}
-//	if (overlayOnly)
-//	{
-//		if (crosshairsNeeded() || config::FloatVMUs)
-//			overlay.draw(settings.display.width, settings.display.height, config::FloatVMUs, true);
-//	}
-//	else
-//	{
-//		overlay.draw(settings.display.width, settings.display.height, true, false);
-//	}
+	if (overlayOnly)
+	{
+		if (crosshairsNeeded() || config::FloatVMUs)
+			overlay.draw(settings.display.width, settings.display.height, config::FloatVMUs, true);
+	}
+	else
+	{
+		overlay.draw(settings.display.width, settings.display.height, true, false);
+	}
 	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 	frameRendered = true;
 }
@@ -219,20 +255,12 @@ void DX11Context::resize()
 		return;
 	if (swapchain)
 	{
-		BOOL fullscreen;
-		swapchain->GetFullscreenState(&fullscreen, nullptr);
-		NOTICE_LOG(RENDERER, "DX11Context::resize: current display is %d x %d fullscreen %d", settings.display.width, settings.display.height, fullscreen);
-		ID3D11RenderTargetView* views[1] {};
-		pDeviceContext->OMSetRenderTargets(ARRAY_SIZE(views), views, nullptr);
+		ID3D11RenderTargetView *nullRTV = nullptr;
+		pDeviceContext->OMSetRenderTargets(1, &nullRTV, nullptr);
 		renderTargetView.reset();
 #ifdef TARGET_UWP
-		// FIXME how to get correct width/height?
 		HRESULT hr = swapchain->ResizeBuffers(2, settings.display.width, settings.display.height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
 #else
-		DXGI_SWAP_CHAIN_DESC swapchainDesc;
-	    swapchain->GetDesc(&swapchainDesc);
-		NOTICE_LOG(RENDERER, "current swapchain desc: %d x %d windowed %d", swapchainDesc.BufferDesc.Width, swapchainDesc.BufferDesc.Height, swapchainDesc.Windowed);
-
 		HRESULT hr = swapchain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
 		if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
 		{
@@ -271,7 +299,7 @@ void DX11Context::resize()
 			settings.display.width = desc.Width;
 			settings.display.height = desc.Height;
 #endif
-			NOTICE_LOG(RENDERER, "swapchain desc: %d x %d", desc.Width, desc.Height);
+			NOTICE_LOG(RENDERER, "Swapchain resized: %d x %d", desc.Width, desc.Height);
 		}
 		else
 		{
@@ -292,3 +320,5 @@ void DX11Context::handleDeviceLost()
 	rend_init_renderer();
 	rend_resize_renderer();
 }
+#endif // !LIBRETRO
+

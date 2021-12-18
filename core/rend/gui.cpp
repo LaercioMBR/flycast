@@ -63,6 +63,8 @@ static bool error_msg_shown;
 static std::string osd_message;
 static double osd_message_end;
 static std::mutex osd_message_mutex;
+static void (*showOnScreenKeyboard)(bool show);
+static bool keysUpNextFrame[512];
 
 static int map_system = 0;
 static void reset_vmus();
@@ -278,6 +280,11 @@ void gui_keyboard_key(u8 keyCode, bool pressed, u8 modifiers)
 	if (!inited)
 		return;
 	ImGuiIO& io = ImGui::GetIO();
+	if (!pressed && io.KeysDown[keyCode])
+	{
+		keysUpNextFrame[keyCode] = true;
+		return;
+	}
 	io.KeyCtrl = (modifiers & (0x01 | 0x10)) != 0;
 	io.KeyShift = (modifiers & (0x02 | 0x20)) != 0;
 	io.KeysDown[keyCode] = pressed;
@@ -314,7 +321,7 @@ void gui_set_mouse_wheel(float delta)
 	mouseWheel += delta;
 }
 
-static void ImGui_Impl_NewFrame()
+static void gui_newFrame()
 {
 	imguiDriver->newFrame();
 	ImGui::GetIO().DisplaySize.x = settings.display.width;
@@ -367,6 +374,30 @@ static void ImGui_Impl_NewFrame()
 		io.NavInputs[ImGuiNavInput_LStickDown] = 0.f;
 
 	ImGui::GetStyle().Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.06f, 0.06f, 0.06f, 0.94f);
+
+	if (showOnScreenKeyboard != nullptr)
+		showOnScreenKeyboard(io.WantTextInput);
+}
+
+static void delayedKeysUp()
+{
+	ImGuiIO& io = ImGui::GetIO();
+	for (u32 i = 0; i < ARRAY_SIZE(keysUpNextFrame); i++)
+		if (keysUpNextFrame[i])
+			io.KeysDown[i] = false;
+	memset(keysUpNextFrame, 0, sizeof(keysUpNextFrame));
+}
+
+static void gui_endFrame()
+{
+    ImGui::Render();
+    imguiDriver->renderDrawData(ImGui::GetDrawData());
+    delayedKeysUp();
+}
+
+void gui_setOnScreenKeyboardCallback(void (*callback)(bool show))
+{
+	showOnScreenKeyboard = callback;
 }
 
 void gui_set_insets(int left, int right, int top, int bottom)
@@ -401,17 +432,7 @@ void gui_open_settings()
 		{
 			gui_state = GuiState::Commands;
 			HideOSD();
-#ifdef TARGET_UWP
-			if (config::ThreadedRendering)
-			{
-				static std::future<void> f;
-				f = std::async(std::launch::async, [] {
-					emu.stop();
-				});
-			}
-			else
-#endif
-				emu.stop();
+			emu.stop();
 		}
 		else
 			chat.toggle();
@@ -1106,7 +1127,7 @@ void error_popup()
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, padding);
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, padding);
 		ImGui::OpenPopup("Error");
-		if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove))
+		if (ImGui::BeginPopupModal("Error", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar))
 		{
 			ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 400.f * scaling);
 			ImGui::TextWrapped("%s", error_msg.c_str());
@@ -1555,6 +1576,10 @@ static void gui_display_settings()
 				renderApi = 3;
 				perPixel = false;
 				break;
+			case RenderType::DirectX11_OIT:
+				renderApi = 3;
+				perPixel = true;
+				break;
 			}
 
 			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, normal_padding);
@@ -1769,7 +1794,7 @@ static void gui_display_settings()
 		    	config::RendererType = RenderType::DirectX9;
 		    	break;
 		    case 3:
-		    	config::RendererType = RenderType::DirectX11;
+		    	config::RendererType = perPixel ? RenderType::DirectX11_OIT : RenderType::DirectX11;
 		    	break;
 		    }
 		}
@@ -2275,22 +2300,22 @@ static void gui_network_start()
 
 	if (networkStatus.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
 	{
+		ImGui::Text("Starting...");
 		try {
 			if (networkStatus.get())
 			{
 				gui_state = GuiState::Closed;
-				ImGui::Text("Starting...");
 			}
 			else
 			{
-				gui_state = GuiState::Main;
 				emu.unloadGame();
+				gui_state = GuiState::Main;
 			}
 		} catch (const FlycastException& e) {
 			NetworkHandshake::instance->stop();
-			gui_state = GuiState::Main;
 			emu.unloadGame();
 			gui_error(e.what());
+			gui_state = GuiState::Main;
 		}
 	}
 	else
@@ -2307,25 +2332,13 @@ static void gui_network_start()
 	if (ImGui::Button("Cancel", ImVec2(100.f * scaling, 0.f)))
 	{
 		NetworkHandshake::instance->stop();
-#ifdef TARGET_UWP
-		static std::future<void> f;
-		f = std::async(std::launch::async, [] {
-			try {
-				networkStatus.get();
-			}
-			catch (const FlycastException& e) {
-			}
-			emu.unloadGame();
-			gui_state = GuiState::Main;
-		});
-#else
 		try {
 			networkStatus.get();
-		} catch (const FlycastException& e) {
 		}
-		gui_state = GuiState::Main;
+		catch (const FlycastException& e) {
+		}
 		emu.unloadGame();
-#endif
+		gui_state = GuiState::Main;
 	}
 	ImGui::PopStyleVar();
 
@@ -2405,7 +2418,7 @@ void gui_display_ui()
 		}
 	}
 
-	ImGui_Impl_NewFrame();
+	gui_newFrame();
 	ImGui::NewFrame();
 	error_msg_shown = false;
 
@@ -2450,8 +2463,7 @@ void gui_display_ui()
 		break;
 	}
 	error_popup();
-    ImGui::Render();
-    imguiDriver->renderDrawData(ImGui::GetDrawData());
+	gui_endFrame();
 
 	if (gui_state == GuiState::Closed)
 		emu.start();
@@ -2491,7 +2503,7 @@ void gui_display_osd()
 
 //	if (!message.empty() || config::FloatVMUs || crosshairsNeeded() || (ggpo::active() && config::NetworkStats))
 	{
-		ImGui_Impl_NewFrame();
+		gui_newFrame();
 		ImGui::NewFrame();
 
 		if (!message.empty())
@@ -2518,8 +2530,7 @@ void gui_display_osd()
 		}
 		lua::overlay();
 
-		ImGui::Render();
-		imguiDriver->renderDrawData(ImGui::GetDrawData());
+		gui_endFrame();
 	}
 }
 
@@ -2577,3 +2588,13 @@ void gui_error(const std::string& what)
 {
 	error_msg = what;
 }
+
+#ifdef TARGET_UWP
+// Ugly but a good workaround for MS stupidity
+// UWP doesn't allow the UI thread to wait on a thread/task. When an std::future is ready, it is possible
+// that the task has not yet completed. Calling std::future::get() at this point will throw an exception
+// AND destroy the std::future at the same time, rendering it invalid and discarding the future result.
+bool __cdecl Concurrency::details::_Task_impl_base::_IsNonBlockingThread() {
+	return false;
+}
+#endif

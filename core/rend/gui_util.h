@@ -25,6 +25,7 @@
 #include "imgui/imgui_internal.h"
 #include "gui.h"
 #include "emulator.h"
+#include "stdclass.h"
 
 typedef bool (*StringCallback)(bool cancelled, std::string selection);
 
@@ -79,31 +80,14 @@ public:
 
 	void cancel()
 	{
-		progress.cancelled = true;
-#ifdef TARGET_UWP
-		if (future.valid())
-		{
-			if (progress.cancelled)
-				return;
-			static std::future<void> f;
-			f = std::async(std::launch::async, [this] {
-				try {
-					future.get();
-				}
-				catch (const FlycastException& e) {
-				}
-				emu.unloadGame();
-				gui_state = GuiState::Main;
-			});
+		if (progress.cancelled)
 			return;
-		}
-#else
+		progress.cancelled = true;
 		if (future.valid())
 			try {
 				future.get();
-			} catch (const FlycastException& e) {
+			} catch (const FlycastException&) {
 			}
-#endif
 		emu.unloadGame();
 		gui_state = GuiState::Main;
 	}
